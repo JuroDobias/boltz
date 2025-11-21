@@ -657,7 +657,7 @@ class ContactPotentital(FlatBottomPotential, DistancePotential):
         negation_mask = feats["contact_negation_mask"][0]
         lower_bounds = None
         upper_bounds = feats["contact_thresholds"][0].clone()
-        k = torch.ones_like(upper_bounds)
+        k = feats.get("contact_weights", [torch.ones_like(upper_bounds)])[0].clone()
         return (
             index,
             (k, lower_bounds, upper_bounds),

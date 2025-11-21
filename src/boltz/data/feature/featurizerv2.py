@@ -620,7 +620,7 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
         list[tuple[int, list[tuple[int, int]], float]]
     ] = False,
     inference_contact_constraints: Optional[
-        list[tuple[tuple[int, int], tuple[int, int], float]]
+        list[tuple[tuple[int, int], tuple[int, int], float, bool, float]]
     ] = False,
     override_method: Optional[str] = None,
 ) -> dict[str, Tensor]:
@@ -735,7 +735,8 @@ def process_token_features(  # noqa: C901, PLR0915, PLR0912
                     contact_threshold[idx, binder_mask] = max_distance
 
     if inference_contact_constraints is not None:
-        for token1, token2, max_distance, force in inference_contact_constraints:
+        for contact in inference_contact_constraints:
+            token1, token2, max_distance = contact[:3]
             for idx1, _token1 in enumerate(token_data):
                 if (
                     _token1["mol_type"] != const.chain_type_ids["NONPOLYMER"]
@@ -2059,11 +2060,13 @@ def process_chain_feature_constraints(data: Tokenized) -> dict[str, Tensor]:
 def process_contact_feature_constraints(
     data: Tokenized,
     inference_pocket_constraints: list[tuple[int, list[tuple[int, int]], float]],
-    inference_contact_constraints: list[tuple[tuple[int, int], tuple[int, int], float]],
+    inference_contact_constraints: list[
+        tuple[tuple[int, int], tuple[int, int], float, bool, float]
+    ],
 ):
     token_data = data.tokens
     union_idx = 0
-    pair_index, union_index, negation_mask, thresholds = [], [], [], []
+    pair_index, union_index, negation_mask, thresholds, weights = [], [], [], [], []
     for binder, contacts, max_distance, force in inference_pocket_constraints:
         if not force:
             continue
@@ -2094,7 +2097,7 @@ def process_contact_feature_constraints(
                 thresholds.append(torch.full((atom_idx_pairs.shape[1],), max_distance))
                 union_idx += 1
 
-    for token1, token2, max_distance, force in inference_contact_constraints:
+    for token1, token2, max_distance, force, weight in inference_contact_constraints:
         if not force:
             continue
 
@@ -2134,6 +2137,9 @@ def process_contact_feature_constraints(
                         thresholds.append(
                             torch.full((atom_idx_pairs.shape[1],), max_distance)
                         )
+                        weights.append(
+                            torch.full((atom_idx_pairs.shape[1],), weight)
+                        )
                         union_idx += 1
                         break
                 break
@@ -2143,17 +2149,21 @@ def process_contact_feature_constraints(
         union_index = torch.cat(union_index)
         negation_mask = torch.cat(negation_mask)
         thresholds = torch.cat(thresholds)
+        weights = torch.cat(weights) if weights else torch.ones_like(thresholds)
     else:
         pair_index = torch.empty((2, 0), dtype=torch.long)
         union_index = torch.empty((0,), dtype=torch.long)
         negation_mask = torch.empty((0,), dtype=torch.bool)
         thresholds = torch.empty((0,), dtype=torch.float32)
+        weights = torch.empty((0,), dtype=torch.float32)
 
     return {
         "contact_pair_index": pair_index,
         "contact_union_index": union_index,
         "contact_negation_mask": negation_mask,
         "contact_thresholds": thresholds,
+        "contact_weights": weights,
+        "contact_weights": weights,
     }
 
 
@@ -2198,7 +2208,7 @@ class Boltz2Featurizer:
             list[tuple[int, list[tuple[int, int]], float]]
         ] = None,
         inference_contact_constraints: Optional[
-            list[tuple[tuple[int, int], tuple[int, int], float]]
+            list[tuple[tuple[int, int], tuple[int, int], float, float]]
         ] = None,
         compute_affinity: bool = False,
     ) -> dict[str, Tensor]:

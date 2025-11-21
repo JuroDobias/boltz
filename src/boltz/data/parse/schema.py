@@ -1943,6 +1943,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 raise ValueError(msg)
 
             max_distance = constraint["contact"].get("max_distance", 6.0)
+            weight = constraint["contact"].get("weight", 1.0)
 
             chain_name1, residue_index_or_atom_name1 = constraint["contact"]["token1"]
             token1 = token_spec_to_ids(
@@ -1964,7 +1965,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             )
             force = constraint["contact"].get("force", False)
 
-            contact_constraints.append((token1, token2, max_distance, force))
+            contact_constraints.append((token1, token2, max_distance, force, weight))
         else:
             msg = f"Invalid constraint: {constraint}"
             raise ValueError(msg)

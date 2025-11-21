@@ -525,7 +525,7 @@ class InferenceOptions:
         list[tuple[int, list[tuple[int, int]], float, bool]]
     ] = None
     contact_constraints: Optional[
-        list[tuple[tuple[int, int], tuple[int, int], float, bool]]
+        list[tuple[tuple[int, int], tuple[int, int], float, bool, float]]
     ] = None
 
 
