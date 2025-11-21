@@ -1208,6 +1208,27 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # Load manifest
     manifest = Manifest.load(out_dir / "processed" / "manifest.json")
 
+    def _has_forced_constraints(manifest: Manifest) -> bool:
+        for record in manifest.records:
+            opts = record.inference_options
+            if opts is None:
+                continue
+            if any(pc[3] for pc in opts.pocket_constraints or []):
+                return True
+            if any(cc[3] for cc in opts.contact_constraints or []):
+                return True
+            dihedrals = getattr(opts, "dihedral_constraints", None)
+            if dihedrals and any(len(dc) >= 7 and dc[6] for dc in dihedrals):
+                return True
+        return False
+
+    if (not use_potentials) and _has_forced_constraints(manifest):
+        msg = (
+            "Force constraints are present, but --use_potentials was not enabled. "
+            "Enable potentials to enforce constraints or unset force."
+        )
+        raise RuntimeError(msg)
+
     # Filter out existing predictions
     filtered_manifest = filter_inputs_structure(
         manifest=manifest,
