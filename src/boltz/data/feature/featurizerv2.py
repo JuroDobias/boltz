@@ -2163,7 +2163,40 @@ def process_contact_feature_constraints(
         "contact_negation_mask": negation_mask,
         "contact_thresholds": thresholds,
         "contact_weights": weights,
-        "contact_weights": weights,
+    }
+
+
+def process_dihedral_feature_constraints(
+    inference_dihedral_constraints: list[tuple[int, int, int, int, float, float, bool]]
+):
+    if len(inference_dihedral_constraints) == 0:
+        return {
+            "dihedral_index": torch.empty((4, 0), dtype=torch.long),
+            "dihedral_lower_bounds": torch.empty((0,), dtype=torch.float32),
+            "dihedral_upper_bounds": torch.empty((0,), dtype=torch.float32),
+        }
+
+    index = []
+    lower = []
+    upper = []
+    for entry in inference_dihedral_constraints:
+        if len(entry) == 7:
+            a1, a2, a3, a4, target, tol, force = entry
+            if not force:
+                continue
+        else:
+            a1, a2, a3, a4, target, tol = entry
+        index.append([a1, a2, a3, a4])
+        lower.append(target - tol)
+        upper.append(target + tol)
+
+    index = torch.tensor(index, dtype=torch.long).T
+    lower = torch.tensor(lower, dtype=torch.float32)
+    upper = torch.tensor(upper, dtype=torch.float32)
+    return {
+        "dihedral_index": index,
+        "dihedral_lower_bounds": lower,
+        "dihedral_upper_bounds": upper,
     }
 
 
@@ -2208,7 +2241,10 @@ class Boltz2Featurizer:
             list[tuple[int, list[tuple[int, int]], float]]
         ] = None,
         inference_contact_constraints: Optional[
-            list[tuple[tuple[int, int], tuple[int, int], float, float]]
+            list[tuple[tuple[int, int], tuple[int, int], float, bool, float]]
+        ] = None,
+        inference_dihedral_constraints: Optional[
+            list[tuple[int, int, int, int, float, float, bool]]
         ] = None,
         compute_affinity: bool = False,
     ) -> dict[str, Tensor]:
@@ -2340,6 +2376,7 @@ class Boltz2Featurizer:
         residue_constraint_features = {}
         chain_constraint_features = {}
         contact_constraint_features = {}
+        dihedral_constraint_features = {}
         if compute_constraint_features:
             residue_constraint_features = process_residue_constraint_features(data)
             chain_constraint_features = process_chain_feature_constraints(data)
@@ -2347,6 +2384,11 @@ class Boltz2Featurizer:
                 data=data,
                 inference_pocket_constraints=inference_pocket_constraints if inference_pocket_constraints else [],
                 inference_contact_constraints=inference_contact_constraints if inference_contact_constraints else [],
+            )
+            dihedral_constraint_features = process_dihedral_feature_constraints(
+                inference_dihedral_constraints
+                if inference_dihedral_constraints
+                else []
             )
 
         return {
@@ -2360,5 +2402,6 @@ class Boltz2Featurizer:
             **residue_constraint_features,
             **chain_constraint_features,
             **contact_constraint_features,
+            **dihedral_constraint_features,
             **ligand_to_mw,
         }

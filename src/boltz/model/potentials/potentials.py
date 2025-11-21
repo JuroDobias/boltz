@@ -667,6 +667,15 @@ class ContactPotentital(FlatBottomPotential, DistancePotential):
         )
 
 
+class DihedralConstraintPotential(FlatBottomPotential, DihedralPotential):
+    def compute_args(self, feats, parameters):
+        index = feats["dihedral_index"][0]
+        lower_bounds = feats["dihedral_lower_bounds"][0].clone()
+        upper_bounds = feats["dihedral_upper_bounds"][0].clone()
+        k = torch.ones_like(lower_bounds)
+        return index, (k, lower_bounds, upper_bounds), None, None, None
+
+
 def get_potentials(steering_args, boltz2=False):
     potentials = []
     if steering_args["fk_steering"] or steering_args["physical_guidance_update"]:
@@ -771,6 +780,19 @@ def get_potentials(steering_args, boltz2=False):
                         "union_lambda": ExponentialInterpolation(
                             start=8.0, end=0.0, alpha=-2.0
                         ),
+                    }
+                ),
+                DihedralConstraintPotential(
+                    parameters={
+                        "guidance_interval": 4,
+                        "guidance_weight": (
+                            PiecewiseStepFunction(
+                                thresholds=[0.25, 0.75], values=[0.0, 0.5, 1.0]
+                            )
+                            if steering_args["contact_guidance_update"]
+                            else 0.0
+                        ),
+                        "resampling_weight": 1.0,
                     }
                 ),
                 TemplateReferencePotential(

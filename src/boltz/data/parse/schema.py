@@ -935,22 +935,27 @@ def token_spec_to_ids(
     smiles_mols=None,
 ):
     if chains[chain_name].type == const.chain_type_ids["NONPOLYMER"]:
-        # Non-polymer chains are indexed by atom name
-        if (
-            isinstance(residue_index_or_atom_name, str)
-            and smiles_mols is not None
-            and chain_name in smiles_mols
-            and "/" in residue_index_or_atom_name
-        ):
-            smarts_pattern, atom_in_smarts = residue_index_or_atom_name.rsplit(
-                "/", maxsplit=1
-            )
-            try:
-                atom_in_smarts = int(atom_in_smarts)
-            except ValueError:
-                smarts_pattern = None
+        # Non-polymer chains are indexed by atom name, allow SMARTS + atom idx.
+        if smiles_mols is not None and chain_name in smiles_mols:
+            smarts_pattern = None
+            atom_in_smarts = None
+            if isinstance(residue_index_or_atom_name, (list, tuple)):
+                if len(residue_index_or_atom_name) == 2:
+                    smarts_pattern, atom_in_smarts = residue_index_or_atom_name
+            elif isinstance(residue_index_or_atom_name, str) and "/" in str(
+                residue_index_or_atom_name
+            ):
+                smarts_pattern, atom_in_smarts = residue_index_or_atom_name.rsplit(
+                    "/", maxsplit=1
+                )
 
-            if smarts_pattern:
+            if smarts_pattern is not None:
+                try:
+                    atom_in_smarts = int(atom_in_smarts)
+                except ValueError:
+                    smarts_pattern = None
+
+            if smarts_pattern is not None:
                 if atom_in_smarts < 1:
                     msg = (
                         "SMARTS atom index must be 1-indexed and larger than zero. "
@@ -974,8 +979,6 @@ def token_spec_to_ids(
                     )
                     raise ValueError(msg)
 
-                # If multiple substructure matches exist, use the first one;
-                # users can disambiguate by providing a more specific SMARTS.
                 match = matches[0]
                 atom_idx_in_match = atom_in_smarts - 1
                 if atom_idx_in_match >= len(match):
@@ -994,20 +997,21 @@ def token_spec_to_ids(
                         f"{chain_name}."
                     )
                     raise ValueError(msg)
-                atom_name = atom.GetProp("name")
-                residue_index_or_atom_name = atom_name
+                residue_index_or_atom_name = atom.GetProp("name")
 
         _, _, atom_idx = atom_idx_map[(chain_name, 0, residue_index_or_atom_name)]
         return (chain_to_idx[chain_name], atom_idx)
     else:
-        # Polymer chains are indexed by residue index
-        if isinstance(residue_index_or_atom_name, str):
-            # Allow numeric strings, and tolerate an optional trailing "/...".
-            token_str = residue_index_or_atom_name
+        if isinstance(residue_index_or_atom_name, (list, tuple)):
+            res_idx = residue_index_or_atom_name[0]
+        else:
+            res_idx = residue_index_or_atom_name
+        if isinstance(res_idx, str):
+            token_str = res_idx
             if "/" in token_str:
                 token_str = token_str.split("/", 1)[0]
             try:
-                residue_index_or_atom_name = int(token_str)
+                res_idx = int(token_str)
             except ValueError as exc:
                 msg = (
                     f"Chain {chain_name} is a polymer; contact/pocket constraints "
@@ -1015,8 +1019,7 @@ def token_spec_to_ids(
                     "are only supported for ligands specified via SMILES."
                 )
                 raise ValueError(msg) from exc
-
-        return chain_to_idx[chain_name], residue_index_or_atom_name - 1
+        return chain_to_idx[chain_name], res_idx - 1
 
 
 def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
@@ -1790,6 +1793,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     connections = []
     pocket_constraints = []
     contact_constraints = []
+    dihedral_constraints = []
     constraints = schema.get("constraints", [])
     for constraint in constraints:
         if "bond" in constraint:
@@ -1966,6 +1970,85 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             force = constraint["contact"].get("force", False)
 
             contact_constraints.append((token1, token2, max_distance, force, weight))
+        elif "dihedral" in constraint:
+            if "atoms" not in constraint["dihedral"]:
+                msg = "Dihedral constraint was not properly specified"
+                raise ValueError(msg)
+
+            if not boltz_2:
+                msg = "Dihedral constraint is not supported in Boltz-1!"
+                raise ValueError(msg)
+
+            atoms_spec = constraint["dihedral"]["atoms"]
+            if len(atoms_spec) != 6:
+                msg = "Dihedral atoms must be [CHAIN_ID, SMARTS, i1, i2, i3, i4]"
+                raise ValueError(msg)
+
+            chain_name, smarts_pattern, a1_idx, a2_idx, a3_idx, a4_idx = atoms_spec
+            if chains[chain_name].type != const.chain_type_ids["NONPOLYMER"]:
+                msg = "Dihedral constraints are only supported for ligands (SMILES/SDF)"
+                raise ValueError(msg)
+            if chain_name not in smiles_mols:
+                msg = (
+                    f"Chain {chain_name} requires a SMILES/SDF ligand to use dihedral "
+                    "constraints."
+                )
+                raise ValueError(msg)
+
+            try:
+                atom_indices = [int(a1_idx), int(a2_idx), int(a3_idx), int(a4_idx)]
+            except ValueError:
+                msg = "Dihedral atom indices must be integers"
+                raise ValueError(msg)
+            if any(idx < 1 for idx in atom_indices):
+                msg = "Dihedral atom indices must be 1-indexed and positive"
+                raise ValueError(msg)
+
+            smarts = Chem.MolFromSmarts(smarts_pattern)
+            if smarts is None:
+                msg = f"Invalid SMARTS pattern '{smarts_pattern}' for dihedral constraint"
+                raise ValueError(msg)
+
+            matches = smiles_mols[chain_name].GetSubstructMatches(smarts)
+            if len(matches) == 0:
+                msg = (
+                    f"SMARTS pattern '{smarts_pattern}' for chain {chain_name} "
+                    "did not match the ligand."
+                )
+                raise ValueError(msg)
+            match = matches[0]
+
+            def _get_atom_idx(match_idx: int) -> int:
+                if match_idx - 1 >= len(match):
+                    msg_inner = (
+                        f"SMARTS atom index {match_idx} is out of range for pattern "
+                        f"'{smarts_pattern}' (only {len(match)} atoms) on chain "
+                        f"{chain_name}."
+                    )
+                    raise ValueError(msg_inner)
+                rdkit_idx = match[match_idx - 1]
+                atom = smiles_mols[chain_name].GetAtomWithIdx(rdkit_idx)
+                if not atom.HasProp("name"):
+                    msg_inner = (
+                        f"Could not find atom names for SMARTS match on chain {chain_name}."
+                    )
+                    raise ValueError(msg_inner)
+                atom_name = atom.GetProp("name")
+                _, _, atom_idx = atom_idx_map[(chain_name, 0, atom_name)]
+                return atom_idx
+
+            d_atoms = [_get_atom_idx(i) for i in atom_indices]
+
+            target_deg = constraint["dihedral"].get("target_deg", None)
+            tolerance_deg = constraint["dihedral"].get("tolerance_deg", None)
+            if target_deg is None or tolerance_deg is None:
+                msg = "Dihedral constraint must specify target_deg and tolerance_deg"
+                raise ValueError(msg)
+            target = float(target_deg) * np.pi / 180.0
+            tol = float(tolerance_deg) * np.pi / 180.0
+            force = constraint["dihedral"].get("force", False)
+
+            dihedral_constraints.append((*d_atoms, target, tol, force))
         else:
             msg = f"Invalid constraint: {constraint}"
             raise ValueError(msg)
@@ -2178,7 +2261,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         chain_infos.append(chain_info)
 
     options = InferenceOptions(
-        pocket_constraints=pocket_constraints, contact_constraints=contact_constraints
+        pocket_constraints=pocket_constraints,
+        contact_constraints=contact_constraints,
+        dihedral_constraints=dihedral_constraints,
     )
     record = Record(
         id=name,
