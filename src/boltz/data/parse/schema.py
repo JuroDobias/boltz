@@ -927,14 +927,95 @@ def parse_polymer(
 
 
 def token_spec_to_ids(
-    chain_name, residue_index_or_atom_name, chain_to_idx, atom_idx_map, chains
+    chain_name,
+    residue_index_or_atom_name,
+    chain_to_idx,
+    atom_idx_map,
+    chains,
+    smiles_mols=None,
 ):
     if chains[chain_name].type == const.chain_type_ids["NONPOLYMER"]:
         # Non-polymer chains are indexed by atom name
+        if (
+            isinstance(residue_index_or_atom_name, str)
+            and smiles_mols is not None
+            and chain_name in smiles_mols
+            and "/" in residue_index_or_atom_name
+        ):
+            smarts_pattern, atom_in_smarts = residue_index_or_atom_name.rsplit(
+                "/", maxsplit=1
+            )
+            try:
+                atom_in_smarts = int(atom_in_smarts)
+            except ValueError:
+                smarts_pattern = None
+
+            if smarts_pattern:
+                if atom_in_smarts < 1:
+                    msg = (
+                        "SMARTS atom index must be 1-indexed and larger than zero. "
+                        f"Got {atom_in_smarts} for chain {chain_name}."
+                    )
+                    raise ValueError(msg)
+
+                smarts = Chem.MolFromSmarts(smarts_pattern)
+                if smarts is None:
+                    msg = (
+                        f"Invalid SMARTS pattern '{smarts_pattern}' "
+                        f"for chain {chain_name}."
+                    )
+                    raise ValueError(msg)
+
+                matches = smiles_mols[chain_name].GetSubstructMatches(smarts)
+                if len(matches) == 0:
+                    msg = (
+                        f"SMARTS pattern '{smarts_pattern}' for chain {chain_name} "
+                        "did not match the ligand."
+                    )
+                    raise ValueError(msg)
+
+                # If multiple substructure matches exist, use the first one;
+                # users can disambiguate by providing a more specific SMARTS.
+                match = matches[0]
+                atom_idx_in_match = atom_in_smarts - 1
+                if atom_idx_in_match >= len(match):
+                    msg = (
+                        f"SMARTS atom index {atom_in_smarts} is out of range for "
+                        f"pattern '{smarts_pattern}' (only {len(match)} atoms) on "
+                        f"chain {chain_name}."
+                    )
+                    raise ValueError(msg)
+
+                rdkit_atom_idx = match[atom_idx_in_match]
+                atom = smiles_mols[chain_name].GetAtomWithIdx(rdkit_atom_idx)
+                if not atom.HasProp("name"):
+                    msg = (
+                        f"Could not find atom names for SMARTS match on chain "
+                        f"{chain_name}."
+                    )
+                    raise ValueError(msg)
+                atom_name = atom.GetProp("name")
+                residue_index_or_atom_name = atom_name
+
         _, _, atom_idx = atom_idx_map[(chain_name, 0, residue_index_or_atom_name)]
         return (chain_to_idx[chain_name], atom_idx)
     else:
         # Polymer chains are indexed by residue index
+        if isinstance(residue_index_or_atom_name, str):
+            # Allow numeric strings, and tolerate an optional trailing "/...".
+            token_str = residue_index_or_atom_name
+            if "/" in token_str:
+                token_str = token_str.split("/", 1)[0]
+            try:
+                residue_index_or_atom_name = int(token_str)
+            except ValueError as exc:
+                msg = (
+                    f"Chain {chain_name} is a polymer; contact/pocket constraints "
+                    "must reference residue indices (1-indexed). SMARTS selectors "
+                    "are only supported for ligands specified via SMILES."
+                )
+                raise ValueError(msg) from exc
+
         return chain_to_idx[chain_name], residue_index_or_atom_name - 1
 
 
@@ -1026,10 +1107,21 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         if entity_type in {"protein", "dna", "rna"}:
             seq = str(item[entity_type]["sequence"])
         elif entity_type == "ligand":
-            assert "smiles" in item[entity_type] or "ccd" in item[entity_type]
-            assert "smiles" not in item[entity_type] or "ccd" not in item[entity_type]
+            assert (
+                "smiles" in item[entity_type]
+                or "ccd" in item[entity_type]
+                or "sdf" in item[entity_type]
+            )
+            assert (
+                ("smiles" not in item[entity_type])
+                + ("ccd" not in item[entity_type])
+                + ("sdf" not in item[entity_type])
+                >= 2
+            )
             if "smiles" in item[entity_type]:
                 seq = str(item[entity_type]["smiles"])
+            elif "sdf" in item[entity_type]:
+                seq = str(item[entity_type]["sdf"])
             else:
                 seq = str(item[entity_type]["ccd"])
 
@@ -1081,12 +1173,14 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     chains: dict[str, ParsedChain] = {}
     chain_to_msa: dict[str, str] = {}
     entity_to_seq: dict[str, str] = {}
+    smiles_mols: dict[str, Mol] = {}
     is_msa_custom = False
     is_msa_auto = False
     ligand_id = 1
     for entity_id, items in enumerate(items_to_group.values()):
         # Get entity type and sequence
         entity_type = next(iter(items[0].keys())).lower()
+        smiles_mol = None
 
         # Get ids
         ids = []
@@ -1137,6 +1231,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 is_msa_custom = True
             elif msa == 0:
                 is_msa_auto = True
+
+        smiles_mol = None
 
         # Parse a polymer
         if entity_type in {"protein", "dna", "rna"}:
@@ -1235,6 +1331,16 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
         elif (entity_type == "ligand") and ("smiles" in items[0][entity_type]):
             seq = items[0][entity_type]["smiles"]
+            use_provided_conformer = items[0][entity_type].get(
+                "use_provided_conformer", False
+            )
+
+            if use_provided_conformer:
+                msg = (
+                    "use_provided_conformer is only supported for ligands specified "
+                    "via SDF. SMILES inputs do not carry coordinates."
+                )
+                raise ValueError(msg)
 
             if affinity:
                 seq = standardize(seq)
@@ -1255,10 +1361,18 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     raise ValueError(msg)
                 atom.SetProp("name", atom_name)
 
-            success = compute_3d_conformer(mol)
-            if not success:
-                msg = f"Failed to compute 3D conformer for {seq}"
+            if use_provided_conformer and mol.GetNumConformers() == 0:
+                msg = (
+                    "use_provided_conformer was set to true, but the provided SMILES "
+                    "did not include 3D coordinates."
+                )
                 raise ValueError(msg)
+
+            if not use_provided_conformer or mol.GetNumConformers() == 0:
+                success = compute_3d_conformer(mol)
+                if not success:
+                    msg = f"Failed to compute 3D conformer for {seq}"
+                    raise ValueError(msg)
 
             mol_no_h = AllChem.RemoveHs(mol, sanitize=False)
 
@@ -1272,6 +1386,100 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                           "which was the maximum during training, therefore the affinity output might be inaccurate.")
 
             affinity_mw = AllChem.Descriptors.MolWt(mol_no_h) if affinity else None
+            extra_mols[f"LIG{ligand_id}"] = mol_no_h
+            residue = parse_ccd_residue(
+                name=f"LIG{ligand_id}",
+                ref_mol=mol,
+                res_idx=0,
+            )
+
+            ligand_id += 1
+            smiles_mol = mol_no_h
+            parsed_chain = ParsedChain(
+                entity=entity_id,
+                residues=[residue],
+                type=const.chain_type_ids["NONPOLYMER"],
+                cyclic_period=0,
+                sequence=None,
+                affinity=affinity,
+                affinity_mw=affinity_mw,
+            )
+
+            assert not items[0][entity_type].get("cyclic", False), (
+                "Cyclic flag is not supported for ligands"
+            )
+
+        elif (entity_type == "ligand") and ("sdf" in items[0][entity_type]):
+            sdf_path = items[0][entity_type]["sdf"]
+            use_provided_conformer = items[0][entity_type].get(
+                "use_provided_conformer", False
+            )
+
+            path = Path(sdf_path)
+            if not path.is_absolute():
+                if path.exists():
+                    pass
+                elif mol_dir is not None and (mol_dir / path).exists():
+                    path = mol_dir / path
+                else:
+                    msg = f"SDF file {path} does not exist."
+                    raise ValueError(msg)
+            elif not path.exists():
+                msg = f"SDF file {path} does not exist."
+                raise ValueError(msg)
+
+            suppl = Chem.SDMolSupplier(str(path), removeHs=False, sanitize=True)
+            mol = next((m for m in suppl if m is not None), None)
+            if mol is None:
+                msg = f"Failed to read SDF file {path}"
+                raise ValueError(msg)
+
+            canonical_order = AllChem.CanonicalRankAtoms(mol)
+            Chem.AssignStereochemistry(mol, force=True, cleanIt=True)
+            for atom, can_idx in zip(mol.GetAtoms(), canonical_order):
+                atom_name = atom.GetSymbol().upper() + str(can_idx + 1)
+                if len(atom_name) > 4:
+                    msg = (
+                        f"{path} has an atom with a name longer than "
+                        f"4 characters: {atom_name}."
+                    )
+                    raise ValueError(msg)
+                atom.SetProp("name", atom_name)
+
+            if use_provided_conformer and mol.GetNumConformers() == 0:
+                msg = (
+                    "use_provided_conformer was set to true, but the provided SDF "
+                    "does not contain 3D coordinates."
+                )
+                raise ValueError(msg)
+
+            if not use_provided_conformer or mol.GetNumConformers() == 0:
+                success = compute_3d_conformer(mol)
+                if not success:
+                    msg = f"Failed to compute 3D conformer for {path}"
+                    raise ValueError(msg)
+
+            mol_no_h = AllChem.RemoveHs(mol, sanitize=False)
+            smiles_mol = mol_no_h
+
+            if affinity:
+                affinity_mw = AllChem.Descriptors.MolWt(mol_no_h)
+
+                if mol_no_h.GetNumAtoms() > 128:
+                    msg = (
+                        "The ligand for affinity is too large, ligands with more than "
+                        "128 atoms are not supported in the affinity prediction module"
+                    )
+                    raise ValueError(msg)
+                elif mol_no_h.GetNumAtoms() > 56:
+                    print(
+                        "WARNING: the ligand used for affinity calculation is larger "
+                        "than 56 heavy-atoms, which was the maximum during training, "
+                        "therefore the affinity output might be inaccurate."
+                    )
+            else:
+                affinity_mw = None
+
             extra_mols[f"LIG{ligand_id}"] = mol_no_h
             residue = parse_ccd_residue(
                 name=f"LIG{ligand_id}",
@@ -1306,6 +1514,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             for chain_name in ids:
                 chains[chain_name] = parsed_chain
                 chain_to_msa[chain_name] = msa
+                if smiles_mol is not None:
+                    smiles_mols[chain_name] = smiles_mol
 
     # Check if msa is custom or auto
     if is_msa_custom and is_msa_auto:
@@ -1519,8 +1729,100 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 msg = f"Bond constraint was not properly specified"
                 raise ValueError(msg)
 
-            c1, r1, a1 = tuple(constraint["bond"]["atom1"])
-            c2, r2, a2 = tuple(constraint["bond"]["atom2"])
+            atom1 = constraint["bond"]["atom1"]
+            atom2 = constraint["bond"]["atom2"]
+
+            def _unpack_atom(spec):
+                if len(spec) == 3:
+                    return spec
+                if len(spec) == 2:
+                    chain_name, atom_name = spec
+                    if chains[chain_name].type != const.chain_type_ids["NONPOLYMER"]:
+                        msg = (
+                            "Two-element atom specs (chain, atom/smarts) are only "
+                            "supported for ligands defined via SMILES."
+                        )
+                        raise ValueError(msg)
+                    # Nonpolymers have a single residue at index 1 for constraints.
+                    return chain_name, 1, atom_name
+                msg = (
+                    "Atom spec must have 2 or 3 elements: [CHAIN, RES_IDX, ATOM] or "
+                    "[CHAIN, SMARTS/IDX] for SMILES ligands."
+                )
+                raise ValueError(msg)
+
+            c1, r1, a1 = _unpack_atom(atom1)
+            c2, r2, a2 = _unpack_atom(atom2)
+
+            # Normalize residue indices if passed as strings
+            if isinstance(r1, str):
+                r1 = int(r1)
+            if isinstance(r2, str):
+                r2 = int(r2)
+
+            # Allow SMARTS/atom-index selectors for ligands provided as SMILES
+            def _resolve_smarts_atom(chain_name, atom_name):
+                if (
+                    chains[chain_name].type != const.chain_type_ids["NONPOLYMER"]
+                    or smiles_mols is None
+                    or chain_name not in smiles_mols
+                    or not isinstance(atom_name, str)
+                    or "/" not in atom_name
+                ):
+                    return atom_name
+
+                smarts_pattern, atom_in_smarts = atom_name.rsplit("/", maxsplit=1)
+                try:
+                    atom_in_smarts = int(atom_in_smarts)
+                except ValueError:
+                    return atom_name
+
+                if atom_in_smarts < 1:
+                    msg = (
+                        "SMARTS atom index must be 1-indexed and larger than zero. "
+                        f"Got {atom_in_smarts} for chain {chain_name}."
+                    )
+                    raise ValueError(msg)
+
+                smarts = Chem.MolFromSmarts(smarts_pattern)
+                if smarts is None:
+                    msg = (
+                        f"Invalid SMARTS pattern '{smarts_pattern}' "
+                        f"for chain {chain_name}."
+                    )
+                    raise ValueError(msg)
+
+                matches = smiles_mols[chain_name].GetSubstructMatches(smarts)
+                if len(matches) == 0:
+                    msg = (
+                        f"SMARTS pattern '{smarts_pattern}' for chain {chain_name} "
+                        "did not match the ligand."
+                    )
+                    raise ValueError(msg)
+
+                match = matches[0]
+                atom_idx_in_match = atom_in_smarts - 1
+                if atom_idx_in_match >= len(match):
+                    msg = (
+                        f"SMARTS atom index {atom_in_smarts} is out of range for "
+                        f"pattern '{smarts_pattern}' (only {len(match)} atoms) on "
+                        f"chain {chain_name}."
+                    )
+                    raise ValueError(msg)
+
+                rdkit_atom_idx = match[atom_idx_in_match]
+                atom = smiles_mols[chain_name].GetAtomWithIdx(rdkit_atom_idx)
+                if not atom.HasProp("name"):
+                    msg = (
+                        f"Could not find atom names for SMARTS match on chain "
+                        f"{chain_name}."
+                    )
+                    raise ValueError(msg)
+                return atom.GetProp("name")
+
+            a1 = _resolve_smarts_atom(c1, a1)
+            a2 = _resolve_smarts_atom(c2, a2)
+
             c1, r1, a1 = atom_idx_map[(c1, r1 - 1, a1)]  # 1-indexed
             c2, r2, a2 = atom_idx_map[(c2, r2 - 1, a2)]  # 1-indexed
             connections.append((c1, c2, r1, r2, a1, a2))
@@ -1554,6 +1856,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     chain_to_idx,
                     atom_idx_map,
                     chains,
+                    smiles_mols,
                 )
                 contacts.append(contact)
 
@@ -1580,6 +1883,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 chain_to_idx,
                 atom_idx_map,
                 chains,
+                smiles_mols,
             )
             chain_name2, residue_index_or_atom_name2 = constraint["contact"]["token2"]
             token2 = token_spec_to_ids(
@@ -1588,6 +1892,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 chain_to_idx,
                 atom_idx_map,
                 chains,
+                smiles_mols,
             )
             force = constraint["contact"].get("force", False)
 
