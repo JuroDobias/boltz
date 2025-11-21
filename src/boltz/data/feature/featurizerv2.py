@@ -2167,36 +2167,45 @@ def process_contact_feature_constraints(
 
 
 def process_dihedral_feature_constraints(
-    inference_dihedral_constraints: list[tuple[int, int, int, int, float, float, bool]]
+    inference_dihedral_constraints: list[
+        tuple[int, int, int, int, float, float, bool, float]
+    ]
 ):
     if len(inference_dihedral_constraints) == 0:
         return {
             "dihedral_index": torch.empty((4, 0), dtype=torch.long),
             "dihedral_lower_bounds": torch.empty((0,), dtype=torch.float32),
             "dihedral_upper_bounds": torch.empty((0,), dtype=torch.float32),
+            "dihedral_weights": torch.empty((0,), dtype=torch.float32),
         }
 
     index = []
     lower = []
     upper = []
+    weights = []
     for entry in inference_dihedral_constraints:
-        if len(entry) == 7:
-            a1, a2, a3, a4, target, tol, force = entry
+        if len(entry) >= 7:
+            a1, a2, a3, a4, target, tol, force = entry[:7]
+            weight = entry[7] if len(entry) >= 8 else 1.0
             if not force:
                 continue
         else:
             a1, a2, a3, a4, target, tol = entry
+            weight = 1.0
         index.append([a1, a2, a3, a4])
         lower.append(target - tol)
         upper.append(target + tol)
+        weights.append(weight)
 
     index = torch.tensor(index, dtype=torch.long).T
     lower = torch.tensor(lower, dtype=torch.float32)
     upper = torch.tensor(upper, dtype=torch.float32)
+    weights = torch.tensor(weights, dtype=torch.float32) if len(weights) > 0 else torch.empty((0,), dtype=torch.float32)
     return {
         "dihedral_index": index,
         "dihedral_lower_bounds": lower,
         "dihedral_upper_bounds": upper,
+        "dihedral_weights": weights,
     }
 
 
@@ -2240,12 +2249,12 @@ class Boltz2Featurizer:
         inference_pocket_constraints: Optional[
             list[tuple[int, list[tuple[int, int]], float]]
         ] = None,
-        inference_contact_constraints: Optional[
-            list[tuple[tuple[int, int], tuple[int, int], float, bool, float]]
-        ] = None,
-        inference_dihedral_constraints: Optional[
-            list[tuple[int, int, int, int, float, float, bool]]
-        ] = None,
+    inference_contact_constraints: Optional[
+        list[tuple[tuple[int, int], tuple[int, int], float, bool, float]]
+    ] = None,
+    inference_dihedral_constraints: Optional[
+        list[tuple[int, int, int, int, float, float, bool, float]]
+    ] = None,
         compute_affinity: bool = False,
     ) -> dict[str, Tensor]:
         """Compute features.

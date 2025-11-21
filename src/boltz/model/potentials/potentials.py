@@ -672,7 +672,7 @@ class DihedralConstraintPotential(FlatBottomPotential, DihedralPotential):
         index = feats["dihedral_index"][0]
         lower_bounds = feats["dihedral_lower_bounds"][0].clone()
         upper_bounds = feats["dihedral_upper_bounds"][0].clone()
-        k = torch.ones_like(lower_bounds)
+        k = feats.get("dihedral_weights", [torch.ones_like(lower_bounds)])[0].clone()
         return index, (k, lower_bounds, upper_bounds), None, None, None
 
 

@@ -2047,6 +2047,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
             target_deg = constraint["dihedral"].get("target_deg", None)
             tolerance_deg = constraint["dihedral"].get("tolerance_deg", None)
+            weight = constraint["dihedral"].get("weight", 1.0)
             if target_deg is None or tolerance_deg is None:
                 msg = "Dihedral constraint must specify target_deg and tolerance_deg"
                 raise ValueError(msg)
@@ -2054,7 +2055,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             tol = float(tolerance_deg) * np.pi / 180.0
             force = constraint["dihedral"].get("force", False)
 
-            dihedral_constraints.append((*d_atoms, target, tol, force))
+            dihedral_constraints.append((*d_atoms, target, tol, force, weight))
         else:
             msg = f"Invalid constraint: {constraint}"
             raise ValueError(msg)

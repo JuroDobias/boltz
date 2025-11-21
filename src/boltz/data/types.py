@@ -528,7 +528,7 @@ class InferenceOptions:
         list[tuple[tuple[int, int], tuple[int, int], float, bool, float]]
     ] = None
     dihedral_constraints: Optional[
-        list[tuple[int, int, int, int, float, float, bool]]
+        list[tuple[int, int, int, int, float, float, bool, float]]
     ] = None
 
 
