@@ -528,6 +528,7 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
     msa_dir: Path,
     mol_dir: Path,
     boltz2: bool,
+    use_potentials: bool,
     use_msa_server: bool,
     msa_server_url: str,
     msa_pairing_strategy: str,
@@ -561,6 +562,31 @@ def process_input(  # noqa: C901, PLR0912, PLR0915, D103
 
         # Get target id
         target_id = target.record.id
+
+        # If constraints marked as force are present but potentials are disabled, abort.
+        if not use_potentials and target.record.inference_options is not None:
+            force_constraints = []
+            opts = target.record.inference_options
+            for pc in opts.pocket_constraints or []:
+                if len(pc) >= 4 and pc[3]:
+                    force_constraints.append("pocket")
+                    break
+            for cc in opts.contact_constraints or []:
+                if len(cc) >= 4 and cc[3]:
+                    force_constraints.append("contact")
+                    break
+            if getattr(opts, "dihedral_constraints", None):
+                for dc in opts.dihedral_constraints:
+                    if len(dc) >= 7 and dc[6]:
+                        force_constraints.append("dihedral")
+                        break
+            if force_constraints:
+                msg = (
+                    f"Input {path} contains force constraints ({', '.join(force_constraints)}), "
+                    "but --use_potentials is not enabled. "
+                    "Enable potentials to enforce constraints."
+                )
+                raise RuntimeError(msg)  # noqa: TRY301
 
         # Get all MSA ids and decide whether to generate MSA
         to_generate = {}
@@ -677,6 +703,7 @@ def process_inputs(
     api_key_value: Optional[str] = None,
     boltz2: bool = False,
     preprocessing_threads: int = 1,
+    use_potentials: bool = False,
 ) -> Manifest:
     """Process the input data and output directory.
 
@@ -775,6 +802,7 @@ def process_inputs(
         msa_dir=msa_dir,
         mol_dir=mol_dir,
         boltz2=boltz2,
+        use_potentials=use_potentials,
         use_msa_server=use_msa_server,
         msa_server_url=msa_server_url,
         msa_pairing_strategy=msa_pairing_strategy,
@@ -1174,6 +1202,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         boltz2=model == "boltz2",
         preprocessing_threads=preprocessing_threads,
         max_msa_seqs=max_msa_seqs,
+        use_potentials=use_potentials,
     )
 
     # Load manifest
