@@ -1334,6 +1334,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             use_provided_conformer = items[0][entity_type].get(
                 "use_provided_conformer", False
             )
+            template_sdf = items[0][entity_type].get("template_sdf", None)
 
             if use_provided_conformer:
                 msg = (
@@ -1373,6 +1374,73 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 if not success:
                     msg = f"Failed to compute 3D conformer for {seq}"
                     raise ValueError(msg)
+
+            # Apply template SDF if provided (must be a substructure of the ligand)
+            if template_sdf is not None:
+                path = Path(template_sdf)
+                if not path.is_absolute():
+                    if path.exists():
+                        pass
+                    elif mol_dir is not None and (mol_dir / path).exists():
+                        path = mol_dir / path
+                    else:
+                        msg = f"Template SDF file {path} does not exist."
+                        raise ValueError(msg)
+                elif not path.exists():
+                    msg = f"Template SDF file {path} does not exist."
+                    raise ValueError(msg)
+
+                suppl = Chem.SDMolSupplier(str(path), removeHs=False, sanitize=True)
+                template_mol = next((m for m in suppl if m is not None), None)
+                if template_mol is None:
+                    msg = f"Failed to read template SDF file {path}"
+                    raise ValueError(msg)
+
+                template_no_h = AllChem.RemoveHs(template_mol, sanitize=False)
+                if template_no_h.GetNumConformers() == 0:
+                    msg = f"Template SDF {path} does not contain 3D coordinates."
+                    raise ValueError(msg)
+                template_conf = template_no_h.GetConformer()
+
+                target_no_h = AllChem.RemoveHs(mol, sanitize=False)
+                match = target_no_h.GetSubstructMatch(template_no_h)
+                if not match:
+                    msg = (
+                        f"Template {path} is not a substructure of the provided SMILES."
+                    )
+                    raise ValueError(msg)
+
+                coord_map = {}
+                for template_idx, target_idx in enumerate(match):
+                    pos = template_conf.GetAtomPosition(template_idx)
+                    coord_map[int(target_idx)] = pos
+
+                mol.RemoveAllConformers()
+                if len(match) == target_no_h.GetNumAtoms():
+                    # Full coverage: copy template coords to heavy atoms; hydrogens set to zero
+                    conf = Chem.Conformer(mol.GetNumAtoms())
+                    for target_idx in range(target_no_h.GetNumAtoms()):
+                        pos = template_conf.GetAtomPosition(target_idx)
+                        conf.SetAtomPosition(target_idx, pos)
+                    for hid in range(target_no_h.GetNumAtoms(), mol.GetNumAtoms()):
+                        conf.SetAtomPosition(hid, (0.0, 0.0, 0.0))
+                    mol.AddConformer(conf, assignId=True)
+                else:
+                    try:
+                        mol = AllChem.ConstrainedEmbed(
+                            mol,
+                            template_no_h,
+                            coordMap=coord_map,
+                            useTethers=True,
+                            randomseed=0xF00D,
+                            enforceChirality=True,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        msg = (
+                            f"Failed to generate constrained conformer using template "
+                            f"{path}: {exc}"
+                        )
+                        raise ValueError(msg) from exc
 
             mol_no_h = AllChem.RemoveHs(mol, sanitize=False)
 
