@@ -998,6 +998,10 @@ def token_spec_to_ids(
                     )
                     raise ValueError(msg)
                 residue_index_or_atom_name = atom.GetProp("name")
+                click.echo(
+                    f"[constraint] SMARTS '{smarts_pattern}' on chain {chain_name} "
+                    f"selected atom '{residue_index_or_atom_name}' (idx {rdkit_atom_idx})"
+                )
 
         _, _, atom_idx = atom_idx_map[(chain_name, 0, residue_index_or_atom_name)]
         return (chain_to_idx[chain_name], atom_idx)
@@ -1801,61 +1805,38 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 msg = f"Bond constraint was not properly specified"
                 raise ValueError(msg)
 
-            atom1 = constraint["bond"]["atom1"]
-            atom2 = constraint["bond"]["atom2"]
+            atom1 = list(constraint["bond"]["atom1"])
+            atom2 = list(constraint["bond"]["atom2"])
 
-            def _unpack_atom(spec):
-                if len(spec) == 3:
-                    return spec
-                if len(spec) == 2:
-                    chain_name, atom_name = spec
-                    if chains[chain_name].type != const.chain_type_ids["NONPOLYMER"]:
-                        msg = (
-                            "Two-element atom specs (chain, atom/smarts) are only "
-                            "supported for ligands defined via SMILES."
-                        )
-                        raise ValueError(msg)
-                    # Nonpolymers have a single residue at index 1 for constraints.
-                    return chain_name, 1, atom_name
-                msg = (
-                    "Atom spec must have 2 or 3 elements: [CHAIN, RES_IDX, ATOM] or "
-                    "[CHAIN, SMARTS/IDX] for SMILES ligands."
-                )
+            if len(atom1) != 3 or len(atom2) != 3:
+                msg = "Bond atoms must be specified as [CHAIN, SPEC1, SPEC2]"
                 raise ValueError(msg)
 
-            c1, r1, a1 = _unpack_atom(atom1)
-            c2, r2, a2 = _unpack_atom(atom2)
+            c1 = atom1[0]
+            c2 = atom2[0]
+            r1, a1 = atom1[1], atom1[2]
+            r2, a2 = atom2[1], atom2[2]
 
-            # Normalize residue indices if passed as strings
-            if isinstance(r1, str):
-                r1 = int(r1)
-            if isinstance(r2, str):
-                r2 = int(r2)
-
-            # Allow SMARTS/atom-index selectors for ligands provided as SMILES
-            def _resolve_smarts_atom(chain_name, atom_name):
+            def _resolve_smarts_atom(chain_name, smarts_and_idx):
                 if (
                     chains[chain_name].type != const.chain_type_ids["NONPOLYMER"]
                     or smiles_mols is None
                     or chain_name not in smiles_mols
-                    or not isinstance(atom_name, str)
-                    or "/" not in atom_name
                 ):
-                    return atom_name
-
-                smarts_pattern, atom_in_smarts = atom_name.rsplit("/", maxsplit=1)
+                    return smarts_and_idx
+                if not isinstance(smarts_and_idx, (list, tuple)) or len(smarts_and_idx) != 2:
+                    return smarts_and_idx
+                smarts_pattern, atom_in_smarts = smarts_and_idx
                 try:
                     atom_in_smarts = int(atom_in_smarts)
                 except ValueError:
-                    return atom_name
-
+                    return smarts_and_idx
                 if atom_in_smarts < 1:
                     msg = (
                         "SMARTS atom index must be 1-indexed and larger than zero. "
                         f"Got {atom_in_smarts} for chain {chain_name}."
                     )
                     raise ValueError(msg)
-
                 smarts = Chem.MolFromSmarts(smarts_pattern)
                 if smarts is None:
                     msg = (
@@ -1863,7 +1844,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                         f"for chain {chain_name}."
                     )
                     raise ValueError(msg)
-
                 matches = smiles_mols[chain_name].GetSubstructMatches(smarts)
                 if len(matches) == 0:
                     msg = (
@@ -1871,7 +1851,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                         "did not match the ligand."
                     )
                     raise ValueError(msg)
-
                 match = matches[0]
                 atom_idx_in_match = atom_in_smarts - 1
                 if atom_idx_in_match >= len(match):
@@ -1881,7 +1860,6 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                         f"chain {chain_name}."
                     )
                     raise ValueError(msg)
-
                 rdkit_atom_idx = match[atom_idx_in_match]
                 atom = smiles_mols[chain_name].GetAtomWithIdx(rdkit_atom_idx)
                 if not atom.HasProp("name"):
@@ -1890,10 +1868,19 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                         f"{chain_name}."
                     )
                     raise ValueError(msg)
-                return atom.GetProp("name")
+                atom_name = atom.GetProp("name")
+                click.echo(
+                    f"[constraint] bond SMARTS '{smarts_pattern}' on chain {chain_name} "
+                    f"selected atom '{atom_name}' (idx {rdkit_atom_idx})"
+                )
+                return atom_name
 
-            a1 = _resolve_smarts_atom(c1, a1)
-            a2 = _resolve_smarts_atom(c2, a2)
+            if chains[c1].type == const.chain_type_ids["NONPOLYMER"]:
+                a1 = _resolve_smarts_atom(c1, [r1, a1])
+                r1 = 1
+            if chains[c2].type == const.chain_type_ids["NONPOLYMER"]:
+                a2 = _resolve_smarts_atom(c2, [r2, a2])
+                r2 = 1
 
             c1, r1, a1 = atom_idx_map[(c1, r1 - 1, a1)]  # 1-indexed
             c2, r2, a2 = atom_idx_map[(c2, r2 - 1, a2)]  # 1-indexed
@@ -1919,9 +1906,12 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             binder = chain_to_idx[binder]
 
             contacts = []
-            for chain_name, residue_index_or_atom_name in constraint["pocket"][
-                "contacts"
-            ]:
+            for contact_spec in constraint["pocket"]["contacts"]:
+                if len(contact_spec) == 3:
+                    chain_name, smarts_pattern, atom_idx = contact_spec
+                    residue_index_or_atom_name = [smarts_pattern, atom_idx]
+                else:
+                    chain_name, residue_index_or_atom_name = contact_spec
                 contact = token_spec_to_ids(
                     chain_name,
                     residue_index_or_atom_name,
@@ -1949,7 +1939,12 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             max_distance = constraint["contact"].get("max_distance", 6.0)
             weight = constraint["contact"].get("weight", 1.0)
 
-            chain_name1, residue_index_or_atom_name1 = constraint["contact"]["token1"]
+            token1_spec = constraint["contact"]["token1"]
+            if len(token1_spec) == 3:
+                chain_name1, smarts1, atom_idx1 = token1_spec
+                residue_index_or_atom_name1 = [smarts1, atom_idx1]
+            else:
+                chain_name1, residue_index_or_atom_name1 = token1_spec
             token1 = token_spec_to_ids(
                 chain_name1,
                 residue_index_or_atom_name1,
@@ -1958,7 +1953,12 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 chains,
                 smiles_mols,
             )
-            chain_name2, residue_index_or_atom_name2 = constraint["contact"]["token2"]
+            token2_spec = constraint["contact"]["token2"]
+            if len(token2_spec) == 3:
+                chain_name2, smarts2, atom_idx2 = token2_spec
+                residue_index_or_atom_name2 = [smarts2, atom_idx2]
+            else:
+                chain_name2, residue_index_or_atom_name2 = token2_spec
             token2 = token_spec_to_ids(
                 chain_name2,
                 residue_index_or_atom_name2,
@@ -2018,7 +2018,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 raise ValueError(msg)
             match = matches[0]
 
-            def _get_atom_idx(match_idx: int) -> int:
+            def _get_atom_idx(match_idx: int) -> tuple[int, str]:
                 if match_idx - 1 >= len(match):
                     msg_inner = (
                         f"SMARTS atom index {match_idx} is out of range for pattern "
@@ -2035,9 +2035,15 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     raise ValueError(msg_inner)
                 atom_name = atom.GetProp("name")
                 _, _, atom_idx = atom_idx_map[(chain_name, 0, atom_name)]
-                return atom_idx
+                return atom_idx, atom_name
 
-            d_atoms = [_get_atom_idx(i) for i in atom_indices]
+            d_atoms_with_names = [_get_atom_idx(i) for i in atom_indices]
+            d_atoms = [x[0] for x in d_atoms_with_names]
+            atom_names = [x[1] for x in d_atoms_with_names]
+            click.echo(
+                f"[constraint] dihedral SMARTS '{smarts_pattern}' on chain {chain_name} "
+                f"selected atoms {atom_names}"
+            )
 
             target_deg = constraint["dihedral"].get("target_deg", None)
             tolerance_deg = constraint["dihedral"].get("tolerance_deg", None)
