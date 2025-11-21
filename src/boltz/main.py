@@ -760,7 +760,7 @@ def process_inputs(
                     cc = list(cc)
                     if len(cc) == 4:
                         cc.append(1.0)
-                    fixed.append(tuple(cc))
+                    fixed.append(cc)
                 io["contact_constraints"] = fixed
             if "dihedral_constraints" in io and io["dihedral_constraints"] is not None:
                 fixed = []
@@ -770,9 +770,9 @@ def process_inputs(
                         dc.extend([False, 1.0])
                     elif len(dc) == 7:
                         dc.append(1.0)
-                    fixed.append(tuple(dc))
+                    fixed.append(dc)
                 io["dihedral_constraints"] = fixed
-            data["inference_options"] = InferenceOptions(**io)
+            data["inference_options"] = io
         return Record.from_dict(data)
 
     # Check if records exist at output path
