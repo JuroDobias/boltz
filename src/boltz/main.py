@@ -772,7 +772,7 @@ def process_inputs(
                         dc.append(1.0)
                     fixed.append(tuple(dc))
                 io["dihedral_constraints"] = fixed
-            data["inference_options"] = InferenceOptions.from_dict(io)
+            data["inference_options"] = InferenceOptions(**io)
         return Record.from_dict(data)
 
     # Check if records exist at output path
