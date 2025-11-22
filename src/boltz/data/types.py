@@ -11,6 +11,41 @@ from rdkit.Chem import Mol
 # SERIALIZABLE
 ####################################################################################################
 
+def normalize_inference_options(io: Optional[dict]) -> Optional[dict]:
+    """Normalize inference_options dictionaries for backward compatibility.
+
+    Ensures optional fields such as weights / force flags are always present so
+    downstream parsing does not silently drop constraints.
+    """
+    if io is None:
+        return None
+
+    io = dict(io)
+    if "contact_constraints" in io and io["contact_constraints"] is not None:
+        fixed = []
+        for cc in io["contact_constraints"]:
+            cc = list(cc)
+            if len(cc) == 4:
+                cc.append(1.0)
+            fixed.append(cc)
+        io["contact_constraints"] = fixed
+
+    if "dihedral_constraints" in io and io["dihedral_constraints"] is not None:
+        fixed = []
+        for dc in io["dihedral_constraints"]:
+            dc = list(dc)
+            if len(dc) == 6:
+                dc.extend([False, 1.0])
+            elif len(dc) == 7:
+                dc.append(1.0)
+            # Force flag may come in as non-bool from legacy json
+            if len(dc) >= 7:
+                dc[6] = bool(dc[6])
+            fixed.append(dc)
+        io["dihedral_constraints"] = fixed
+
+    return io
+
 
 class NumpySerializable:
     """Serializable datatype."""
@@ -682,9 +717,24 @@ class Manifest(JSONSerializable):
         with path.open("r") as f:
             data = json.load(f)
             if isinstance(data, dict):
+                records_data = data.get("records", [])
+                norm_records = []
+                for record in records_data:
+                    record = dict(record)
+                    record["inference_options"] = normalize_inference_options(
+                        record.get("inference_options")
+                    )
+                    norm_records.append(record)
+                data["records"] = norm_records
                 manifest = cls.from_dict(data)
             elif isinstance(data, list):
-                records = [Record.from_dict(r) for r in data]
+                records = []
+                for record in data:
+                    record = dict(record)
+                    record["inference_options"] = normalize_inference_options(
+                        record.get("inference_options")
+                    )
+                    records.append(Record.from_dict(record))
                 manifest = cls(records=records)
             else:
                 msg = "Invalid manifest file."

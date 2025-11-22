@@ -2197,6 +2197,14 @@ def process_dihedral_feature_constraints(
         upper.append(target + tol)
         weights.append(weight)
 
+    if len(index) == 0:
+        return {
+            "dihedral_index": torch.empty((4, 0), dtype=torch.long),
+            "dihedral_lower_bounds": torch.empty((0,), dtype=torch.float32),
+            "dihedral_upper_bounds": torch.empty((0,), dtype=torch.float32),
+            "dihedral_weights": torch.empty((0,), dtype=torch.float32),
+        }
+
     index = torch.tensor(index, dtype=torch.long).T
     lower = torch.tensor(lower, dtype=torch.float32)
     upper = torch.tensor(upper, dtype=torch.float32)

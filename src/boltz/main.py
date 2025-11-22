@@ -29,7 +29,13 @@ from boltz.data.parse.a3m import parse_a3m
 from boltz.data.parse.csv import parse_csv
 from boltz.data.parse.fasta import parse_fasta
 from boltz.data.parse.yaml import parse_yaml
-from boltz.data.types import InferenceOptions, MSA, Manifest, Record
+from boltz.data.types import (
+    InferenceOptions,
+    MSA,
+    Manifest,
+    Record,
+    normalize_inference_options,
+)
 from boltz.data.write.writer import BoltzAffinityWriter, BoltzWriter
 from boltz.model.models.boltz1 import Boltz1
 from boltz.model.models.boltz2 import Boltz2
@@ -752,27 +758,8 @@ def process_inputs(
     def load_record_safe(path: Path) -> Record:
         with path.open() as f:
             data = json.load(f)
-        io = data.get("inference_options", None)
-        if io is not None:
-            if "contact_constraints" in io and io["contact_constraints"] is not None:
-                fixed = []
-                for cc in io["contact_constraints"]:
-                    cc = list(cc)
-                    if len(cc) == 4:
-                        cc.append(1.0)
-                    fixed.append(cc)
-                io["contact_constraints"] = fixed
-            if "dihedral_constraints" in io and io["dihedral_constraints"] is not None:
-                fixed = []
-                for dc in io["dihedral_constraints"]:
-                    dc = list(dc)
-                    if len(dc) == 6:
-                        dc.extend([False, 1.0])
-                    elif len(dc) == 7:
-                        dc.append(1.0)
-                    fixed.append(dc)
-                io["dihedral_constraints"] = fixed
-            data["inference_options"] = io
+        io = normalize_inference_options(data.get("inference_options", None))
+        data["inference_options"] = io
         return Record.from_dict(data)
 
     # Check if records exist at output path
