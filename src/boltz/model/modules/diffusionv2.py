@@ -32,7 +32,10 @@ from boltz.model.modules.utils import (
     default,
     log,
 )
-from boltz.model.potentials.potentials import get_potentials
+from boltz.model.potentials.potentials import (
+    DihedralConstraintPotential,
+    get_potentials,
+)
 
 
 class DiffusionModule(Module):
@@ -301,12 +304,22 @@ class AtomDiffusion(Module):
         steering_args=None,
         **network_condition_kwargs,
     ):
+        dihedral_debug_done = False
+        dihedral_count = 0
+        has_dihedral_potential = False
         if steering_args is not None and (
             steering_args["fk_steering"]
             or steering_args["physical_guidance_update"]
             or steering_args["contact_guidance_update"]
         ):
             potentials = get_potentials(steering_args, boltz2=True)
+        else:
+            potentials = []
+
+        if potentials:
+            feats = network_condition_kwargs.get("feats", {})
+            dihedral_count = feats["dihedral_index"].shape[-1] if "dihedral_index" in feats else 0
+            has_dihedral_potential = any(isinstance(p, DihedralConstraintPotential) for p in potentials)
 
         if steering_args["fk_steering"]:
             multiplicity = multiplicity * steering_args["num_particles"]
@@ -394,6 +407,16 @@ class AtomDiffusion(Module):
                         ),
                     )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+
+                if (
+                    not dihedral_debug_done
+                    and has_dihedral_potential
+                    and dihedral_count > 0
+                ):
+                    print(  # noqa: T201
+                        f"[steering] applying {dihedral_count} dihedral constraints"
+                    )
+                    dihedral_debug_done = True
 
                 if steering_args["fk_steering"] and (
                     (
