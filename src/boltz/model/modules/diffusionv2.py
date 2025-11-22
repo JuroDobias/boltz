@@ -305,8 +305,11 @@ class AtomDiffusion(Module):
         **network_condition_kwargs,
     ):
         dihedral_debug_done = False
+        dihedral_detail_done = False
+        stereochem_debug_done = False
         dihedral_count = 0
         has_dihedral_potential = False
+        dihedral_potential = None
         if steering_args is not None and (
             steering_args["fk_steering"]
             or steering_args["physical_guidance_update"]
@@ -321,15 +324,27 @@ class AtomDiffusion(Module):
             dihedral_count = (
                 feats["dihedral_index"].shape[-1] if "dihedral_index" in feats else 0
             )
-            has_dihedral_potential = any(
-                isinstance(p, DihedralConstraintPotential) for p in potentials
+            dihedral_potential = next(
+                (p for p in potentials if isinstance(p, DihedralConstraintPotential)),
+                None,
             )
+            has_dihedral_potential = dihedral_potential is not None
             if not dihedral_debug_done:
                 print(  # noqa: T201
                     "[steering] dihedral potential present="
                     f"{has_dihedral_potential}, constraints={dihedral_count}"
                 )
                 dihedral_debug_done = True
+            if not stereochem_debug_done:
+                chiral = feats.get("chiral_atom_index", torch.empty((4, 0)))
+                stereo = feats.get("stereo_bond_index", torch.empty((4, 0)))
+                planar = feats.get("planar_bond_index", torch.empty((6, 0)))
+                print(  # noqa: T201
+                    "[steering] stereochem constraints "
+                    f"chiral={chiral.shape[-1]} stereo={stereo.shape[-1]} "
+                    f"planar={planar.shape[-1]}"
+                )
+                stereochem_debug_done = True
 
         if steering_args["fk_steering"]:
             multiplicity = multiplicity * steering_args["num_particles"]
@@ -423,6 +438,26 @@ class AtomDiffusion(Module):
                         f"[steering] step {step_idx} sigma={sigma_tm:.3g}->"
                         f"{sigma_t:.3g} dihedral_count={dihedral_count}"
                     )
+                    if not dihedral_detail_done and dihedral_potential is not None:
+                        params = dihedral_potential.compute_parameters(steering_t)
+                        angles = dihedral_potential.compute_variable(
+                            atom_coords_denoised[:1],
+                            feats["dihedral_index"][0],
+                            compute_gradient=False,
+                        )
+                        energy = dihedral_potential.compute(
+                            atom_coords_denoised[:1], feats, params
+                        )
+                        angles_deg = (
+                            angles[0].detach().cpu().numpy()
+                            if torch.is_tensor(angles)
+                            else np.array([])
+                        )
+                        print(  # noqa: T201
+                            "[steering] dihedral angles (deg) first sample: "
+                            f"{angles_deg[:5].tolist()} energy={energy[0].item():.4f}"
+                        )
+                        dihedral_detail_done = True
 
                 if steering_args["fk_steering"] and (
                     (
