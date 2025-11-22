@@ -297,6 +297,10 @@ class PredictionDataset(torch.utils.data.Dataset):
                 override_method=self.override_method,
                 compute_affinity=self.affinity,
             )
+            dihedral_idx_shape = features.get("dihedral_index", torch.empty(0)).shape
+            print(  # noqa: T201
+                f"[constraints] batch {record.id} dihedral_index shape={dihedral_idx_shape}"
+            )
         except Exception as e:  # noqa: BLE001
             import traceback
 

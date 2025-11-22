@@ -418,15 +418,11 @@ class AtomDiffusion(Module):
                     )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
 
-                if (
-                    not dihedral_debug_done
-                    and has_dihedral_potential
-                    and dihedral_count > 0
-                ):
+                if has_dihedral_potential and dihedral_count > 0:
                     print(  # noqa: T201
-                        f"[steering] applying {dihedral_count} dihedral constraints"
+                        f"[steering] step {step_idx} sigma={sigma_tm:.3g}->"
+                        f"{sigma_t:.3g} dihedral_count={dihedral_count}"
                     )
-                    dihedral_debug_done = True
 
                 if steering_args["fk_steering"] and (
                     (

@@ -2171,6 +2171,9 @@ def process_dihedral_feature_constraints(
         tuple[int, int, int, int, float, float, bool, float]
     ]
 ):
+    print(  # noqa: T201
+        f"[constraints] dihedral raw count={len(inference_dihedral_constraints)}"
+    )
     if len(inference_dihedral_constraints) == 0:
         return {
             "dihedral_index": torch.empty((4, 0), dtype=torch.long),
@@ -2188,6 +2191,10 @@ def process_dihedral_feature_constraints(
             a1, a2, a3, a4, target, tol, force = entry[:7]
             weight = entry[7] if len(entry) >= 8 else 1.0
             if not force:
+                print(  # noqa: T201
+                    "[constraints] skipping non-forced dihedral "
+                    f"{(a1, a2, a3, a4)}"
+                )
                 continue
         else:
             a1, a2, a3, a4, target, tol = entry
@@ -2209,6 +2216,10 @@ def process_dihedral_feature_constraints(
     lower = torch.tensor(lower, dtype=torch.float32)
     upper = torch.tensor(upper, dtype=torch.float32)
     weights = torch.tensor(weights, dtype=torch.float32) if len(weights) > 0 else torch.empty((0,), dtype=torch.float32)
+    print(  # noqa: T201
+        "[constraints] dihedral processed count="
+        f"{index.shape[-1]}, weights set={weights.numel()}"
+    )
     return {
         "dihedral_index": index,
         "dihedral_lower_bounds": lower,
@@ -2393,11 +2404,11 @@ class Boltz2Featurizer:
         residue_constraint_features = {}
         chain_constraint_features = {}
         contact_constraint_features = {}
-        dihedral_constraint_features = {}
-        if compute_constraint_features:
-            residue_constraint_features = process_residue_constraint_features(data)
-            chain_constraint_features = process_chain_feature_constraints(data)
-            contact_constraint_features = process_contact_feature_constraints(
+            dihedral_constraint_features = {}
+            if compute_constraint_features:
+                residue_constraint_features = process_residue_constraint_features(data)
+                chain_constraint_features = process_chain_feature_constraints(data)
+                contact_constraint_features = process_contact_feature_constraints(
                 data=data,
                 inference_pocket_constraints=inference_pocket_constraints if inference_pocket_constraints else [],
                 inference_contact_constraints=inference_contact_constraints if inference_contact_constraints else [],
@@ -2407,6 +2418,14 @@ class Boltz2Featurizer:
                 if inference_dihedral_constraints
                 else []
             )
+            if compute_constraint_features:
+                print(  # noqa: T201
+                    "[constraints] dihedral feature shapes "
+                    f"idx={dihedral_constraint_features['dihedral_index'].shape} "
+                    f"lower={dihedral_constraint_features['dihedral_lower_bounds'].shape} "
+                    f"upper={dihedral_constraint_features['dihedral_upper_bounds'].shape} "
+                    f"weights={dihedral_constraint_features['dihedral_weights'].shape}"
+                )
 
         return {
             **token_features,
