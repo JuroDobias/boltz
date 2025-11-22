@@ -318,8 +318,18 @@ class AtomDiffusion(Module):
 
         if potentials:
             feats = network_condition_kwargs.get("feats", {})
-            dihedral_count = feats["dihedral_index"].shape[-1] if "dihedral_index" in feats else 0
-            has_dihedral_potential = any(isinstance(p, DihedralConstraintPotential) for p in potentials)
+            dihedral_count = (
+                feats["dihedral_index"].shape[-1] if "dihedral_index" in feats else 0
+            )
+            has_dihedral_potential = any(
+                isinstance(p, DihedralConstraintPotential) for p in potentials
+            )
+            if not dihedral_debug_done:
+                print(  # noqa: T201
+                    "[steering] dihedral potential present="
+                    f"{has_dihedral_potential}, constraints={dihedral_count}"
+                )
+                dihedral_debug_done = True
 
         if steering_args["fk_steering"]:
             multiplicity = multiplicity * steering_args["num_particles"]
