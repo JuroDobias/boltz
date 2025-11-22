@@ -2404,28 +2404,31 @@ class Boltz2Featurizer:
         residue_constraint_features = {}
         chain_constraint_features = {}
         contact_constraint_features = {}
-            dihedral_constraint_features = {}
-            if compute_constraint_features:
-                residue_constraint_features = process_residue_constraint_features(data)
-                chain_constraint_features = process_chain_feature_constraints(data)
-                contact_constraint_features = process_contact_feature_constraints(
+        dihedral_constraint_features = {}
+        if compute_constraint_features:
+            residue_constraint_features = process_residue_constraint_features(data)
+            chain_constraint_features = process_chain_feature_constraints(data)
+            contact_constraint_features = process_contact_feature_constraints(
                 data=data,
-                inference_pocket_constraints=inference_pocket_constraints if inference_pocket_constraints else [],
-                inference_contact_constraints=inference_contact_constraints if inference_contact_constraints else [],
+                inference_pocket_constraints=inference_pocket_constraints
+                if inference_pocket_constraints
+                else [],
+                inference_contact_constraints=inference_contact_constraints
+                if inference_contact_constraints
+                else [],
             )
             dihedral_constraint_features = process_dihedral_feature_constraints(
                 inference_dihedral_constraints
                 if inference_dihedral_constraints
                 else []
             )
-            if compute_constraint_features:
-                print(  # noqa: T201
-                    "[constraints] dihedral feature shapes "
-                    f"idx={dihedral_constraint_features['dihedral_index'].shape} "
-                    f"lower={dihedral_constraint_features['dihedral_lower_bounds'].shape} "
-                    f"upper={dihedral_constraint_features['dihedral_upper_bounds'].shape} "
-                    f"weights={dihedral_constraint_features['dihedral_weights'].shape}"
-                )
+            print(  # noqa: T201
+                "[constraints] dihedral feature shapes "
+                f"idx={dihedral_constraint_features['dihedral_index'].shape} "
+                f"lower={dihedral_constraint_features['dihedral_lower_bounds'].shape} "
+                f"upper={dihedral_constraint_features['dihedral_upper_bounds'].shape} "
+                f"weights={dihedral_constraint_features['dihedral_weights'].shape}"
+            )
 
         return {
             **token_features,
