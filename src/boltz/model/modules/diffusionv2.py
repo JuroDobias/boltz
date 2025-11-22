@@ -33,7 +33,10 @@ from boltz.model.modules.utils import (
     log,
 )
 from boltz.model.potentials.potentials import (
+    ChiralAtomPotential,
     DihedralConstraintPotential,
+    PlanarBondPotential,
+    StereoBondPotential,
     get_potentials,
 )
 
@@ -305,7 +308,6 @@ class AtomDiffusion(Module):
         **network_condition_kwargs,
     ):
         dihedral_debug_done = False
-        dihedral_detail_done = False
         stereochem_debug_done = False
         dihedral_count = 0
         has_dihedral_potential = False
@@ -438,7 +440,7 @@ class AtomDiffusion(Module):
                         f"[steering] step {step_idx} sigma={sigma_tm:.3g}->"
                         f"{sigma_t:.3g} dihedral_count={dihedral_count}"
                     )
-                    if not dihedral_detail_done and dihedral_potential is not None:
+                    if dihedral_potential is not None:
                         params = dihedral_potential.compute_parameters(steering_t)
                         angles = dihedral_potential.compute_variable(
                             atom_coords_denoised[:1],
@@ -454,10 +456,29 @@ class AtomDiffusion(Module):
                             else np.array([])
                         )
                         print(  # noqa: T201
-                            "[steering] dihedral angles (deg) first sample: "
-                            f"{angles_deg[:5].tolist()} energy={energy[0].item():.4f}"
+                            "[steering] dihedral step "
+                            f"{step_idx} angles(deg)={angles_deg[:5].tolist()} "
+                            f"energy={energy[0].item():.4f}"
                         )
-                        dihedral_detail_done = True
+                    # Stereochem potentials (chiral / stereo bond / planar)
+                    for potential in potentials:
+                        if not isinstance(
+                            potential,
+                            (
+                                ChiralAtomPotential,
+                                StereoBondPotential,
+                                PlanarBondPotential,
+                            ),
+                        ):
+                            continue
+                        params = potential.compute_parameters(steering_t)
+                        energy = potential.compute(
+                            atom_coords_denoised[:1], feats, params
+                        )
+                        print(  # noqa: T201
+                            f"[steering] {potential.__class__.__name__} "
+                            f"step {step_idx} energy={energy[0].item():.4f}"
+                        )
 
                 if steering_args["fk_steering"] and (
                     (
