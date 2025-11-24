@@ -1026,6 +1026,78 @@ def token_spec_to_ids(
         return chain_to_idx[chain_name], res_idx - 1
 
 
+def dihedral_token_to_atom_idx(
+    chain_name,
+    residue_index_or_atom_name,
+    chain_to_idx,
+    atom_idx_map,
+    chains,
+    smiles_mols=None,
+):
+    """Resolve a dihedral token to an atom index."""
+    if chain_name not in chains:
+        msg = f"Chain {chain_name} not found in input."
+        raise ValueError(msg)
+
+    chain_type = chains[chain_name].type
+    if chain_type == const.chain_type_ids["NONPOLYMER"]:
+        _, atom_idx = token_spec_to_ids(
+            chain_name,
+            residue_index_or_atom_name,
+            chain_to_idx,
+            atom_idx_map,
+            chains,
+            smiles_mols,
+        )
+        return atom_idx
+
+    # Polymeric: require residue index and atom name.
+    res_idx = None
+    atom_name = None
+    token = residue_index_or_atom_name
+    if isinstance(token, (list, tuple)):
+        if len(token) == 2:
+            res_idx, atom_name = token
+        elif len(token) == 1:
+            res_idx = token[0]
+        else:
+            msg = (
+                "Polymer dihedral tokens must be [RES_IDX, ATOM_NAME] or "
+                "\"RES_IDX/ATOM_NAME\"."
+            )
+            raise ValueError(msg)
+    else:
+        token_str = str(token)
+        if "/" in token_str:
+            res_part, atom_name = token_str.split("/", 1)
+            res_idx = res_part
+        else:
+            res_idx = token_str
+
+    if atom_name is None:
+        msg = (
+            "Polymer dihedral tokens must specify an atom name, e.g., "
+            "[A, 40, CG] or [A, \"40/CG\"]."
+        )
+        raise ValueError(msg)
+
+    try:
+        res_idx_int = int(res_idx)
+    except ValueError as exc:
+        msg = f"Residue index must be an integer for chain {chain_name}. Got {res_idx}."
+        raise ValueError(msg) from exc
+
+    key = (chain_name, res_idx_int - 1, atom_name)
+    if key not in atom_idx_map:
+        msg = (
+            f"Could not resolve atom '{atom_name}' in residue {res_idx_int} "
+            f"on chain {chain_name}."
+        )
+        raise ValueError(msg)
+    _, _, atom_idx = atom_idx_map[key]
+    return atom_idx
+
+
 def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     name: str,
     schema: dict,
@@ -1971,7 +2043,10 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
 
             contact_constraints.append((token1, token2, max_distance, force, weight))
         elif "dihedral" in constraint:
-            if "atoms" not in constraint["dihedral"]:
+            dihedral_def = constraint["dihedral"]
+            if "atoms" not in dihedral_def and not all(
+                k in dihedral_def for k in ("token1", "token2", "token3", "token4")
+            ):
                 msg = "Dihedral constraint was not properly specified"
                 raise ValueError(msg)
 
@@ -1979,81 +2054,102 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 msg = "Dihedral constraint is not supported in Boltz-1!"
                 raise ValueError(msg)
 
-            atoms_spec = constraint["dihedral"]["atoms"]
-            if len(atoms_spec) != 6:
-                msg = "Dihedral atoms must be [CHAIN_ID, SMARTS, i1, i2, i3, i4]"
-                raise ValueError(msg)
+            d_atoms = []
+            atom_names = []
+            if "atoms" in dihedral_def:
+                atoms_spec = dihedral_def["atoms"]
+                if len(atoms_spec) != 6:
+                    msg = "Dihedral atoms must be [CHAIN_ID, SMARTS, i1, i2, i3, i4]"
+                    raise ValueError(msg)
 
-            chain_name, smarts_pattern, a1_idx, a2_idx, a3_idx, a4_idx = atoms_spec
-            if chains[chain_name].type != const.chain_type_ids["NONPOLYMER"]:
-                msg = "Dihedral constraints are only supported for ligands (SMILES/SDF)"
-                raise ValueError(msg)
-            if chain_name not in smiles_mols:
-                msg = (
-                    f"Chain {chain_name} requires a SMILES/SDF ligand to use dihedral "
-                    "constraints."
-                )
-                raise ValueError(msg)
-
-            try:
-                atom_indices = [int(a1_idx), int(a2_idx), int(a3_idx), int(a4_idx)]
-            except ValueError:
-                msg = "Dihedral atom indices must be integers"
-                raise ValueError(msg)
-            if any(idx < 1 for idx in atom_indices):
-                msg = "Dihedral atom indices must be 1-indexed and positive"
-                raise ValueError(msg)
-
-            smarts = Chem.MolFromSmarts(smarts_pattern)
-            if smarts is None:
-                msg = f"Invalid SMARTS pattern '{smarts_pattern}' for dihedral constraint"
-                raise ValueError(msg)
-
-            matches = smiles_mols[chain_name].GetSubstructMatches(smarts)
-            if len(matches) == 0:
-                msg = (
-                    f"SMARTS pattern '{smarts_pattern}' for chain {chain_name} "
-                    "did not match the ligand."
-                )
-                raise ValueError(msg)
-            match = matches[0]
-
-            def _get_atom_idx(match_idx: int) -> tuple[int, str]:
-                if match_idx - 1 >= len(match):
-                    msg_inner = (
-                        f"SMARTS atom index {match_idx} is out of range for pattern "
-                        f"'{smarts_pattern}' (only {len(match)} atoms) on chain "
-                        f"{chain_name}."
+                chain_name, smarts_pattern, a1_idx, a2_idx, a3_idx, a4_idx = atoms_spec
+                if chains[chain_name].type != const.chain_type_ids["NONPOLYMER"]:
+                    msg = "Dihedral constraints are only supported for ligands (SMILES/SDF)"
+                    raise ValueError(msg)
+                if chain_name not in smiles_mols:
+                    msg = (
+                        f"Chain {chain_name} requires a SMILES/SDF ligand to use dihedral "
+                        "constraints."
                     )
-                    raise ValueError(msg_inner)
-                rdkit_idx = match[match_idx - 1]
-                atom = smiles_mols[chain_name].GetAtomWithIdx(rdkit_idx)
-                if not atom.HasProp("name"):
-                    msg_inner = (
-                        f"Could not find atom names for SMARTS match on chain {chain_name}."
+                    raise ValueError(msg)
+
+                try:
+                    atom_indices = [int(a1_idx), int(a2_idx), int(a3_idx), int(a4_idx)]
+                except ValueError:
+                    msg = "Dihedral atom indices must be integers"
+                    raise ValueError(msg)
+                if any(idx < 1 for idx in atom_indices):
+                    msg = "Dihedral atom indices must be 1-indexed and positive"
+                    raise ValueError(msg)
+
+                smarts = Chem.MolFromSmarts(smarts_pattern)
+                if smarts is None:
+                    msg = f"Invalid SMARTS pattern '{smarts_pattern}' for dihedral constraint"
+                    raise ValueError(msg)
+
+                matches = smiles_mols[chain_name].GetSubstructMatches(smarts)
+                if len(matches) == 0:
+                    msg = (
+                        f"SMARTS pattern '{smarts_pattern}' for chain {chain_name} "
+                        "did not match the ligand."
                     )
-                    raise ValueError(msg_inner)
-                atom_name = atom.GetProp("name")
-                _, _, atom_idx = atom_idx_map[(chain_name, 0, atom_name)]
-                return atom_idx, atom_name
+                    raise ValueError(msg)
+                match = matches[0]
 
-            d_atoms_with_names = [_get_atom_idx(i) for i in atom_indices]
-            d_atoms = [x[0] for x in d_atoms_with_names]
-            atom_names = [x[1] for x in d_atoms_with_names]
-            click.echo(
-                f"[constraint] dihedral SMARTS '{smarts_pattern}' on chain {chain_name} "
-                f"selected atoms {atom_names}"
-            )
+                def _get_atom_idx(match_idx: int) -> tuple[int, str]:
+                    if match_idx - 1 >= len(match):
+                        msg_inner = (
+                            f"SMARTS atom index {match_idx} is out of range for pattern "
+                            f"'{smarts_pattern}' (only {len(match)} atoms) on chain "
+                            f"{chain_name}."
+                        )
+                        raise ValueError(msg_inner)
+                    rdkit_idx = match[match_idx - 1]
+                    atom = smiles_mols[chain_name].GetAtomWithIdx(rdkit_idx)
+                    if not atom.HasProp("name"):
+                        msg_inner = (
+                            f"Could not find atom names for SMARTS match on chain {chain_name}."
+                        )
+                        raise ValueError(msg_inner)
+                    atom_name = atom.GetProp("name")
+                    _, _, atom_idx = atom_idx_map[(chain_name, 0, atom_name)]
+                    return atom_idx, atom_name
 
-            target_deg = constraint["dihedral"].get("target_deg", None)
-            tolerance_deg = constraint["dihedral"].get("tolerance_deg", None)
-            weight = constraint["dihedral"].get("weight", 1.0)
+                d_atoms_with_names = [_get_atom_idx(i) for i in atom_indices]
+                d_atoms = [x[0] for x in d_atoms_with_names]
+                atom_names = [x[1] for x in d_atoms_with_names]
+                click.echo(
+                    f"[constraint] dihedral SMARTS '{smarts_pattern}' on chain {chain_name} "
+                    f"selected atoms {atom_names}"
+                )
+            else:
+                token_keys = ("token1", "token2", "token3", "token4")
+                for tk in token_keys:
+                    token_spec = dihedral_def[tk]
+                    if len(token_spec) == 3:
+                        chain_name, part1, part2 = token_spec
+                        residue_or_atom = [part1, part2]
+                    else:
+                        chain_name, residue_or_atom = token_spec
+                    atom_idx = dihedral_token_to_atom_idx(
+                        chain_name,
+                        residue_or_atom,
+                        chain_to_idx,
+                        atom_idx_map,
+                        chains,
+                        smiles_mols,
+                    )
+                    d_atoms.append(atom_idx)
+
+            target_deg = dihedral_def.get("target_deg", None)
+            tolerance_deg = dihedral_def.get("tolerance_deg", None)
+            weight = dihedral_def.get("weight", 1.0)
             if target_deg is None or tolerance_deg is None:
                 msg = "Dihedral constraint must specify target_deg and tolerance_deg"
                 raise ValueError(msg)
             target = float(target_deg) * np.pi / 180.0
             tol = float(tolerance_deg) * np.pi / 180.0
-            force = constraint["dihedral"].get("force", False)
+            force = dihedral_def.get("force", False)
 
             dihedral_constraints.append((*d_atoms, target, tol, force, weight))
         else:
