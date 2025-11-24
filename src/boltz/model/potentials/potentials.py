@@ -263,18 +263,23 @@ class FlatBottomPotential(Potential):
         pos_overflow_mask = value > upper_bounds
 
         energy = torch.zeros_like(value)
-        energy[neg_overflow_mask] = (k * (lower_bounds - value))[neg_overflow_mask]
-        energy[pos_overflow_mask] = (k * (value - upper_bounds))[pos_overflow_mask]
+        k_expanded = k.expand_as(value)
+        energy[neg_overflow_mask] = (
+            0.5 * k_expanded * (lower_bounds - value) ** 2
+        )[neg_overflow_mask]
+        energy[pos_overflow_mask] = (
+            0.5 * k_expanded * (value - upper_bounds) ** 2
+        )[pos_overflow_mask]
         if not compute_derivative:
             return energy
 
         dEnergy = torch.zeros_like(value)
         dEnergy[neg_overflow_mask] = (
-            -1 * k.expand_as(neg_overflow_mask)[neg_overflow_mask]
-        )
+            k_expanded * (value - lower_bounds)
+        )[neg_overflow_mask]
         dEnergy[pos_overflow_mask] = (
-            1 * k.expand_as(pos_overflow_mask)[pos_overflow_mask]
-        )
+            k_expanded * (value - upper_bounds)
+        )[pos_overflow_mask]
 
         return energy, dEnergy
 
