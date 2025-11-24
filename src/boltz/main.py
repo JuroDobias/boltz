@@ -162,9 +162,6 @@ class BoltzSteeringParams:
     physical_guidance_update: bool = False
     contact_guidance_update: bool = True
     num_gd_steps: int = 20
-    guidance_lr: float = 0.1
-    guidance_backtrack_factor: float = 0.5
-    guidance_backtrack_steps: int = 5
 
 
 @rank_zero_only
