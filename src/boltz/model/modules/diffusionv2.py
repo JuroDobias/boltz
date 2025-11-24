@@ -312,6 +312,8 @@ class AtomDiffusion(Module):
         dihedral_count = 0
         has_dihedral_potential = False
         dihedral_potential = None
+        dihedral_atoms = set()
+        dihedral_overlap_logged = False
         if steering_args is not None and (
             steering_args["fk_steering"]
             or steering_args["physical_guidance_update"]
@@ -326,6 +328,8 @@ class AtomDiffusion(Module):
             dihedral_count = (
                 feats["dihedral_index"].shape[-1] if "dihedral_index" in feats else 0
             )
+            if dihedral_count > 0:
+                dihedral_atoms = set(feats["dihedral_index"][0].flatten().tolist())
             dihedral_potential = next(
                 (p for p in potentials if isinstance(p, DihedralConstraintPotential)),
                 None,
@@ -440,6 +444,26 @@ class AtomDiffusion(Module):
                         f"[steering] step {step_idx} sigma={sigma_tm:.3g}->"
                         f"{sigma_t:.3g} dihedral_count={dihedral_count}"
                     )
+                    if not dihedral_overlap_logged:
+                        overlap = []
+                        for potential in potentials:
+                            try:
+                                params = potential.compute_parameters(steering_t)
+                                idx, *_ = potential.compute_args(
+                                    network_condition_kwargs.get("feats", {}), params
+                                )
+                                if idx.numel() == 0:
+                                    continue
+                                touched = set(idx.flatten().detach().cpu().tolist())
+                                if dihedral_atoms & touched:
+                                    overlap.append(potential.__class__.__name__)
+                            except Exception:
+                                continue
+                        print(  # noqa: T201
+                            "[steering] dihedral atom-overlap potentials="
+                            f"{overlap}"
+                        )
+                        dihedral_overlap_logged = True
                     if dihedral_potential is not None:
                         params = dihedral_potential.compute_parameters(steering_t)
                         angles = dihedral_potential.compute_variable(
@@ -585,14 +609,8 @@ class AtomDiffusion(Module):
                             step_scale *= backtrack_factor
 
                         if not accepted:
-                            # If no candidate lowered energy, keep the smallest step.
-                            final_step = guidance_lr * backtrack_factor ** (
-                                backtrack_steps - 1
-                            )
-                            guidance_update = guidance_update - final_step * energy_gradient
-                            current_energy = _guidance_energy(
-                                atom_coords_denoised + guidance_update
-                            )
+                            # No energy decrease found; skip this guidance step.
+                            continue
 
                         if has_dihedral_potential and dihedral_count > 0:
                             params = dihedral_potential.compute_parameters(steering_t)
