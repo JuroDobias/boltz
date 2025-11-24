@@ -548,6 +548,28 @@ class AtomDiffusion(Module):
                                     parameters,
                                 )
                         guidance_update -= energy_gradient
+                        if has_dihedral_potential and dihedral_count > 0:
+                            params = dihedral_potential.compute_parameters(steering_t)
+                            angles = dihedral_potential.compute_variable(
+                                atom_coords_denoised[:1] + guidance_update[:1],
+                                feats["dihedral_index"][0],
+                                compute_gradient=False,
+                            )
+                            energy = dihedral_potential.compute(
+                                atom_coords_denoised[:1] + guidance_update[:1],
+                                feats,
+                                params,
+                            )
+                            angles_deg = (
+                                torch.rad2deg(angles[0]).detach().cpu().numpy()
+                                if torch.is_tensor(angles)
+                                else np.array([])
+                            )
+                            print(  # noqa: T201
+                                "[steering] dihedral gd_step "
+                                f"{guidance_step} angles(deg)={angles_deg[:5].tolist()} "
+                                f"energy={energy[0].item():.4f}"
+                            )
                     atom_coords_denoised += guidance_update
                     scaled_guidance_update = (
                         guidance_update
