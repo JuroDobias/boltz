@@ -451,7 +451,7 @@ class AtomDiffusion(Module):
                             atom_coords_denoised[:1], feats, params
                         )
                         angles_deg = (
-                            angles[0].detach().cpu().numpy()
+                            torch.rad2deg(angles[0]).detach().cpu().numpy()
                             if torch.is_tensor(angles)
                             else np.array([])
                         )
