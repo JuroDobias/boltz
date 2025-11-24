@@ -556,26 +556,6 @@ class AtomDiffusion(Module):
                         * (sigma_t - t_hat)
                         / t_hat
                     )
-                    if has_dihedral_potential and dihedral_count > 0:
-                        params = dihedral_potential.compute_parameters(steering_t)
-                        angles = dihedral_potential.compute_variable(
-                            atom_coords_denoised[:1],
-                            feats["dihedral_index"][0],
-                            compute_gradient=False,
-                        )
-                        energy = dihedral_potential.compute(
-                            atom_coords_denoised[:1], feats, params
-                        )
-                        angles_deg = (
-                            torch.rad2deg(angles[0]).detach().cpu().numpy()
-                            if torch.is_tensor(angles)
-                            else np.array([])
-                        )
-                        print(  # noqa: T201
-                            "[steering] dihedral step "
-                            f"{step_idx} angles_post_guidance(deg)={angles_deg[:5].tolist()} "
-                            f"energy={energy[0].item():.4f}"
-                        )
 
                 if steering_args["fk_steering"] and (
                     (
