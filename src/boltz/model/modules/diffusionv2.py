@@ -530,9 +530,15 @@ class AtomDiffusion(Module):
                     steering_args["physical_guidance_update"]
                     or steering_args["contact_guidance_update"]
                 ) and step_idx < num_sampling_steps - 1:
+                    guidance_lr = steering_args.get("guidance_lr", 0.1)
+                    backtrack_factor = steering_args.get(
+                        "guidance_backtrack_factor", 0.5
+                    )
+                    backtrack_steps = steering_args.get("guidance_backtrack_steps", 5)
                     guidance_update = torch.zeros_like(atom_coords_denoised)
                     for guidance_step in range(steering_args["num_gd_steps"]):
                         energy_gradient = torch.zeros_like(atom_coords_denoised)
+                        active_potentials = []
                         for potential in potentials:
                             parameters = potential.compute_parameters(steering_t)
                             if (
@@ -540,6 +546,7 @@ class AtomDiffusion(Module):
                                 and (guidance_step) % parameters["guidance_interval"]
                                 == 0
                             ):
+                                active_potentials.append((potential, parameters))
                                 energy_gradient += parameters[
                                     "guidance_weight"
                                 ] * potential.compute_gradient(
@@ -547,7 +554,46 @@ class AtomDiffusion(Module):
                                     network_condition_kwargs["feats"],
                                     parameters,
                                 )
-                        guidance_update -= energy_gradient
+                        if len(active_potentials) == 0:
+                            continue
+
+                        def _guidance_energy(coords):
+                            total = torch.zeros(coords.shape[0], device=coords.device)
+                            for potential, parameters in active_potentials:
+                                total = total + parameters["guidance_weight"] * potential.compute(
+                                    coords,
+                                    feats,
+                                    parameters,
+                                )
+                            return total
+
+                        current_energy = _guidance_energy(
+                            atom_coords_denoised + guidance_update
+                        )
+                        step_scale = guidance_lr
+                        accepted = False
+                        for _ in range(backtrack_steps):
+                            candidate_update = guidance_update - step_scale * energy_gradient
+                            candidate_energy = _guidance_energy(
+                                atom_coords_denoised + candidate_update
+                            )
+                            if candidate_energy.sum() <= current_energy.sum():
+                                guidance_update = candidate_update
+                                current_energy = candidate_energy
+                                accepted = True
+                                break
+                            step_scale *= backtrack_factor
+
+                        if not accepted:
+                            # If no candidate lowered energy, keep the smallest step.
+                            final_step = guidance_lr * backtrack_factor ** (
+                                backtrack_steps - 1
+                            )
+                            guidance_update = guidance_update - final_step * energy_gradient
+                            current_energy = _guidance_energy(
+                                atom_coords_denoised + guidance_update
+                            )
+
                         if has_dihedral_potential and dihedral_count > 0:
                             params = dihedral_potential.compute_parameters(steering_t)
                             angles = dihedral_potential.compute_variable(
