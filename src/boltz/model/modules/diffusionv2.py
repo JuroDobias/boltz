@@ -540,8 +540,6 @@ class AtomDiffusion(Module):
                         energy_gradient = torch.zeros_like(atom_coords_denoised)
                         active_potentials = []
                         for potential in potentials:
-                            if not isinstance(potential, DihedralConstraintPotential):
-                                continue
                             parameters = potential.compute_parameters(steering_t)
                             if (
                                 parameters["guidance_weight"] > 0
