@@ -27,6 +27,7 @@ from boltz.data.types import (
     MSASequence,
     TemplateInfo,
     Tokenized,
+    StructureV2,
 )
 from boltz.model.modules.utils import center_random_augmentation
 
@@ -1672,6 +1673,10 @@ def load_dummy_templates_features(tdim: int, num_tokens: int) -> dict:
     ca_coords = np.zeros((tdim, num_tokens, 3), dtype=np.float32)
     frame_mask = np.zeros((tdim, num_tokens), dtype=np.float32)
     cb_mask = np.zeros((tdim, num_tokens), dtype=np.float32)
+    backbone_coords = np.zeros((tdim, num_tokens, 4, 3), dtype=np.float32)
+    backbone_mask = np.zeros((tdim, num_tokens, 4), dtype=np.float32)
+    backbone_threshold = np.full((tdim, num_tokens, 4), float("inf"), dtype=np.float32)
+    backbone_index = np.full((tdim, num_tokens, 4), -1, dtype=np.int64)
     template_mask = np.zeros((tdim, num_tokens), dtype=np.float32)
     query_to_template = np.zeros((tdim, num_tokens), dtype=np.int64)
     visibility_ids = np.zeros((tdim, num_tokens), dtype=np.float32)
@@ -1687,6 +1692,10 @@ def load_dummy_templates_features(tdim: int, num_tokens: int) -> dict:
         "template_cb": torch.from_numpy(cb_coords),
         "template_ca": torch.from_numpy(ca_coords),
         "template_mask_cb": torch.from_numpy(cb_mask),
+        "template_backbone_coords": torch.from_numpy(backbone_coords),
+        "template_backbone_mask": torch.from_numpy(backbone_mask),
+        "template_backbone_threshold": torch.from_numpy(backbone_threshold),
+        "template_backbone_index": torch.from_numpy(backbone_index),
         "template_mask_frame": torch.from_numpy(frame_mask),
         "template_mask": torch.from_numpy(template_mask),
         "query_to_template": torch.from_numpy(query_to_template),
@@ -1698,6 +1707,9 @@ def compute_template_features(
     query_tokens: Tokenized,
     tmpl_tokens: list[dict],
     num_tokens: int,
+    template_structure: StructureV2,
+    threshold: float,
+    token_to_backbone_idx: np.ndarray,
 ) -> dict:
     """Compute the template features."""
     # Allocate features
@@ -1708,6 +1720,10 @@ def compute_template_features(
     ca_coords = np.zeros((num_tokens, 3), dtype=np.float32)
     frame_mask = np.zeros((num_tokens,), dtype=np.float32)
     cb_mask = np.zeros((num_tokens,), dtype=np.float32)
+    backbone_coords = np.zeros((num_tokens, 4, 3), dtype=np.float32)
+    backbone_mask = np.zeros((num_tokens, 4), dtype=np.float32)
+    backbone_threshold = np.full((num_tokens, 4), threshold, dtype=np.float32)
+    backbone_index = np.full((num_tokens, 4), -1, dtype=np.int64)
     template_mask = np.zeros((num_tokens,), dtype=np.float32)
     query_to_template = np.zeros((num_tokens,), dtype=np.int64)
     visibility_ids = np.zeros((num_tokens,), dtype=np.float32)
@@ -1729,6 +1745,21 @@ def compute_template_features(
         cb_mask[idx] = token["disto_mask"]
         frame_mask[idx] = token["frame_mask"]
         template_mask[idx] = 1.0
+        backbone_index[idx] = token_to_backbone_idx[idx]
+        for b_idx in range(4):
+            if backbone_index[idx, b_idx] >= 0:
+                backbone_mask[idx, b_idx] = 1.0
+
+        # Backbone atom coords/mask (N, CA, C, O) if present in template structure
+        start = token["atom_idx"]
+        end = token["atom_idx"] + token["atom_num"]
+        tmpl_atoms = template_structure.atoms[start:end]
+        name_to_coords = {a["name"]: a["coords"] for a in tmpl_atoms}
+        backbone_names = ["N", "CA", "C", "O"]
+        for b_idx, b_name in enumerate(backbone_names):
+            if b_name in name_to_coords:
+                backbone_coords[idx, b_idx] = name_to_coords[b_name]
+                backbone_mask[idx, b_idx] = 1.0
 
     # Set visibility_id for templated chains
     for asym_id, pdb_id in asym_id_to_pdb_id.items():
@@ -1753,6 +1784,10 @@ def compute_template_features(
         "template_cb": torch.from_numpy(cb_coords),
         "template_ca": torch.from_numpy(ca_coords),
         "template_mask_cb": torch.from_numpy(cb_mask),
+        "template_backbone_coords": torch.from_numpy(backbone_coords),
+        "template_backbone_mask": torch.from_numpy(backbone_mask),
+        "template_backbone_threshold": torch.from_numpy(backbone_threshold),
+        "template_backbone_index": torch.from_numpy(backbone_index),
         "template_mask_frame": torch.from_numpy(frame_mask),
         "template_mask": torch.from_numpy(template_mask),
         "query_to_template": torch.from_numpy(query_to_template),
@@ -1791,6 +1826,18 @@ def process_template_features(
 
     # Compute the offset
     template_features = []
+    token_backbone_idx = np.full((len(data.tokens), 4), -1, dtype=np.int64)
+    # Build backbone atom index mapping for query tokens
+    for token in data.tokens:
+        start = token["atom_idx"]
+        end = token["atom_idx"] + token["atom_num"]
+        atoms = data.structure.atoms[start:end]
+        name_to_idx = {a["name"]: start + i for i, a in enumerate(atoms)}
+        backbone_names = ["N", "CA", "C", "O"]
+        for b_idx, b_name in enumerate(backbone_names):
+            if b_name in name_to_idx:
+                token_backbone_idx[token["token_idx"], b_idx] = name_to_idx[b_name]
+
     for template_id, (template_name, templates) in enumerate(name_to_templates.items()):
         row_tokens = []
         template_structure = data.templates[template_name]
@@ -1819,11 +1866,19 @@ def process_template_features(
                         "token": t,
                         "pdb_id": template_id,
                         "q_idx": q_idx,
+                        "template_structure": template_structure,
                     }
                 )
 
         # Compute template features for each row
-        row_features = compute_template_features(data, row_tokens, max_tokens)
+        row_features = compute_template_features(
+            data,
+            row_tokens,
+            max_tokens,
+            template_structure,
+            template.threshold if template.threshold is not None else float("inf"),
+            token_backbone_idx,
+        )
         row_features["template_force"] = torch.tensor(template.force)
         row_features["template_force_threshold"] = torch.tensor(
             template.threshold if template.threshold is not None else float("inf"),
