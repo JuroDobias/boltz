@@ -655,43 +655,6 @@ class TemplateReferencePotential(FlatBottomPotential, ReferencePotential):
         )
 
 
-class TemplateBackbonePotential(FlatBottomPotential, ReferencePotential):
-    def compute_args(self, feats, parameters):
-        required = [
-            "template_backbone_coords",
-            "template_backbone_mask",
-            "template_backbone_threshold",
-            "template_backbone_index",
-            "template_force",
-        ]
-        if any(r not in feats for r in required):
-            return torch.empty([1, 0]), None, None, None, None
-
-        bb_coords = feats["template_backbone_coords"][feats["template_force"]]
-        bb_mask = feats["template_backbone_mask"][feats["template_force"]].bool()
-        bb_thresh = feats["template_backbone_threshold"][feats["template_force"]]
-        bb_index = feats["template_backbone_index"][feats["template_force"]]
-
-        valid = bb_mask & (bb_index >= 0)
-        if valid.sum() == 0:
-            return torch.empty([1, 0]), None, None, None, None
-
-        ref_coords = bb_coords[valid].clone()
-        ref_mask = torch.ones_like(ref_coords[..., 0], dtype=torch.float32)
-        upper_bounds = bb_thresh[valid].clone()
-        lower_bounds = None
-        k = torch.ones_like(upper_bounds)
-        index = bb_index[valid].long().unsqueeze(0)
-
-        return (
-            index,
-            (k, lower_bounds, upper_bounds),
-            None,
-            (ref_coords, ref_mask, None, None),
-            None,
-        )
-
-
 class ContactPotentital(FlatBottomPotential, DistancePotential):
     def compute_args(self, feats, parameters):
         index = feats["contact_pair_index"][0]
@@ -837,15 +800,6 @@ def get_potentials(steering_args, boltz2=False):
                         "resampling_weight": PiecewiseStepFunction(
                                 thresholds=[0.1], values=[0.1, 1]
                             ),
-                    }
-                ),
-                TemplateBackbonePotential(
-                    parameters={
-                        "guidance_interval": 2,
-                        "guidance_weight": 0.1
-                        if steering_args["contact_guidance_update"]
-                        else 0.0,
-                        "resampling_weight": 1.0,
                     }
                 ),
                 TemplateReferencePotential(
