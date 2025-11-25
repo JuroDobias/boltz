@@ -776,7 +776,7 @@ def get_potentials(steering_args, boltz2=False):
                         "guidance_interval": 4,
                         "guidance_weight": (
                             PiecewiseStepFunction(
-                                thresholds=[0.25, 0.75], values=[0.0, 0.5, 1.0]
+                                thresholds=[0.05, 0.25, 0.75], values=[0.0, 0.25, 0.5, 1]
                             )
                             if steering_args["contact_guidance_update"]
                             else 0.0
@@ -792,12 +792,14 @@ def get_potentials(steering_args, boltz2=False):
                         "guidance_interval": 4,
                         "guidance_weight": (
                             PiecewiseStepFunction(
-                                thresholds=[0.25, 0.75], values=[0.25, 0.5, 1.0]
+                                thresholds=[0.05, 0.25, 0.75], values=[0.0, 0.25, 0.5, 1]
                             )
                             if steering_args["contact_guidance_update"]
                             else 0.0
                         ),
-                        "resampling_weight": 1.0,
+                        "resampling_weight": PiecewiseStepFunction(
+                                thresholds=[0.1], values=[0.1, 1]
+                            ),
                     }
                 ),
                 TemplateReferencePotential(
