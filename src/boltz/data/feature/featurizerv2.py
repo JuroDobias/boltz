@@ -1856,12 +1856,6 @@ def process_template_ligand_features(
             "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
             "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
             "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
-            "fixed_atom_mask": torch.zeros(
-                (1, data.structure.atoms.shape[0]), dtype=torch.bool
-            ),
-            "fixed_atom_coords": torch.zeros(
-                (1, data.structure.atoms.shape[0], 3), dtype=torch.float32
-            ),
         }
 
     # Map chain names to asym_id and chain metadata
@@ -2031,12 +2025,6 @@ def process_template_ligand_features(
             "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
             "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
             "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
-            "fixed_atom_mask": torch.zeros(
-                (1, data.structure.atoms.shape[0]), dtype=torch.bool
-            ),
-            "fixed_atom_coords": torch.zeros(
-                (1, data.structure.atoms.shape[0], 3), dtype=torch.float32
-            ),
         }
 
     ref_coords_t = torch.tensor(ref_coords, dtype=torch.float32).unsqueeze(0)
@@ -2050,13 +2038,6 @@ def process_template_ligand_features(
     atom_to_token = torch.tensor(data.tokens["token_idx"], dtype=torch.long)
     ref_token_index = ref_atom_index_t.clone()
 
-    fixed_mask = torch.zeros((1, data.structure.atoms.shape[0]), dtype=torch.bool)
-    fixed_coords = torch.zeros(
-        (1, data.structure.atoms.shape[0], 3), dtype=torch.float32
-    )
-    fixed_mask[0, ref_atom_index_t[0]] = True
-    fixed_coords[0, ref_atom_index_t[0]] = ref_coords_t[0]
-
     return {
         "template_core_index": index,
         "template_core_coords": ref_coords_t,
@@ -2065,8 +2046,6 @@ def process_template_ligand_features(
         "template_core_threshold": thresholds,
         "template_core_ref_atom_index": ref_atom_index_t,
         "template_core_ref_token_index": ref_token_index,
-        "fixed_atom_mask": fixed_mask,
-        "fixed_atom_coords": fixed_coords,
     }
 
 

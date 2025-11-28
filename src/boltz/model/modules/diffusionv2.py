@@ -370,15 +370,6 @@ class AtomDiffusion(Module):
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
 
-        fixed_mask = None
-        fixed_coords = None
-        feats = network_condition_kwargs.get("feats", {})
-        if "fixed_atom_mask" in feats and "fixed_atom_coords" in feats:
-            fixed_mask = feats["fixed_atom_mask"].to(self.device).bool()
-            fixed_coords = feats["fixed_atom_coords"].to(self.device).float()
-            fixed_mask = fixed_mask.repeat_interleave(multiplicity, 0)
-            fixed_coords = fixed_coords.repeat_interleave(multiplicity, 0)
-
         shape = (*atom_mask.shape, 3)
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
@@ -393,9 +384,6 @@ class AtomDiffusion(Module):
         # atom position is noise at the beginning
         init_sigma = sigmas[0]
         atom_coords = init_sigma * torch.randn(shape, device=self.device)
-        if fixed_mask is not None:
-            atom_coords = atom_coords.clone()
-            atom_coords[fixed_mask] = fixed_coords[fixed_mask]
         token_repr = None
         atom_coords_denoised = None
 
@@ -428,9 +416,6 @@ class AtomDiffusion(Module):
             steering_t = 1.0 - (step_idx / num_sampling_steps)
             noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
             eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
-            if fixed_mask is not None:
-                eps = eps.clone()
-                eps[fixed_mask] = 0.0
             atom_coords_noisy = atom_coords + eps
 
             with torch.no_grad():
@@ -450,8 +435,6 @@ class AtomDiffusion(Module):
                         ),
                     )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
-                if fixed_mask is not None:
-                    atom_coords_denoised[fixed_mask] = fixed_coords[fixed_mask]
 
                 if has_dihedral_potential and dihedral_count > 0:
                     print(  # noqa: T201
@@ -636,8 +619,6 @@ class AtomDiffusion(Module):
                                     parameters,
                                 )
                         guidance_update -= energy_gradient
-                        if fixed_mask is not None:
-                            guidance_update[fixed_mask] = 0.0
                         if has_dihedral_potential and dihedral_potential is not None and dihedral_count > 0:
                             params = dihedral_potential.compute_parameters(steering_t)
                             angles = dihedral_potential.compute_variable(
@@ -661,8 +642,6 @@ class AtomDiffusion(Module):
                                 f"energy={energy[0].item():.4f}"
                             )
                     atom_coords_denoised += guidance_update
-                    if fixed_mask is not None:
-                        atom_coords_denoised[fixed_mask] = fixed_coords[fixed_mask]
                     # Template RMSD after guidance
                     if (
                         "template_core_ref_atom_index" in feats
@@ -776,9 +755,6 @@ class AtomDiffusion(Module):
                         ]
                     if token_repr is not None:
                         token_repr = token_repr[resample_indices]
-                    if fixed_mask is not None:
-                        fixed_mask = fixed_mask[resample_indices]
-                        fixed_coords = fixed_coords[resample_indices]
 
             if self.alignment_reverse_diff:
                 with torch.autocast("cuda", enabled=False):
@@ -796,9 +772,7 @@ class AtomDiffusion(Module):
                 atom_coords_noisy + step_scale * (sigma_t - t_hat) * denoised_over_sigma
             )
 
-                    atom_coords = atom_coords_next
-                    if fixed_mask is not None:
-                        atom_coords[fixed_mask] = fixed_coords[fixed_mask]
+            atom_coords = atom_coords_next
 
         return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
 
