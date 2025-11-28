@@ -655,6 +655,94 @@ class TemplateReferencePotential(FlatBottomPotential, ReferencePotential):
         )
 
 
+class CoreReferencePotential(FlatBottomPotential):
+    """Reference restraint for protein CB/CA + ligand core atoms with separate align mask."""
+
+    def compute_variable(
+        self, coords, index, ref_coords=None, ref_mask=None, compute_gradient=False
+    ):
+        # Not used (see custom compute/compute_gradient); return empty placeholders.
+        if compute_gradient:
+            return torch.empty_like(coords[..., : index.shape[-1], 0]), torch.empty_like(
+                coords[..., : index.shape[-1], 0]
+            )
+        return torch.empty_like(coords[..., : index.shape[-1], 0])
+
+    def compute_args(self, feats, parameters):
+        if "template_core_index" not in feats or feats["template_core_index"].shape[1] == 0:
+            return torch.empty([1, 0]), None, None, None, None
+
+        index = feats["template_core_index"][0]
+        ref_coords = feats["template_core_coords"][0].clone()
+        energy_mask = feats["template_core_mask"][0].clone().bool()
+        align_mask = feats["template_core_align_mask"][0].clone().bool()
+        ref_atom_index = feats["template_core_ref_atom_index"][0].long()
+        ref_token_index = feats["template_core_ref_token_index"][0].long()
+        upper_bounds = feats["template_core_threshold"][0].clone()
+        lower_bounds = None
+        k = torch.ones_like(upper_bounds)
+        return (
+            index,
+            (k, lower_bounds, upper_bounds),
+            (align_mask, energy_mask, ref_coords, ref_atom_index, ref_token_index),
+            None,
+            None,
+        )
+
+    def compute(self, coords, feats, parameters):
+        index, args, align_args, _, _ = self.compute_args(feats, parameters)
+        if index.shape[1] == 0:
+            return torch.zeros(coords.shape[:-2], device=coords.device)
+        k, lower_bounds, upper_bounds = args
+        align_mask, energy_mask, ref_coords, ref_atom_index, _ = align_args
+        ref_atom_index = ref_atom_index.reshape(-1)
+
+        subset = coords.index_select(-2, ref_atom_index)
+        aligned_ref = weighted_rigid_align(
+            ref_coords.float(),
+            subset.float(),
+            align_mask,
+            align_mask,
+        )
+        r = subset - aligned_ref
+        r_norm = torch.linalg.norm(r, dim=-1)
+        r_norm = r_norm * energy_mask
+
+        energy = self.compute_function(
+            r_norm, k, lower_bounds, upper_bounds, negation_mask=None, compute_derivative=False
+        )
+        return energy.sum(dim=tuple(range(1, energy.dim())))
+
+    def compute_gradient(self, coords, feats, parameters):
+        index, args, align_args, _, _ = self.compute_args(feats, parameters)
+        if index.shape[1] == 0:
+            return torch.zeros_like(coords)
+        k, lower_bounds, upper_bounds = args
+        align_mask, energy_mask, ref_coords, ref_atom_index, ref_token_index = align_args
+        ref_atom_index = ref_atom_index.reshape(-1)
+
+        subset = coords.index_select(-2, ref_atom_index).clone().requires_grad_(True)
+        aligned_ref = weighted_rigid_align(
+            ref_coords.float(),
+            subset.float(),
+            align_mask,
+            align_mask,
+        )
+        r = subset - aligned_ref
+        r_norm = torch.linalg.norm(r, dim=-1)
+        r_norm = r_norm * energy_mask
+        energy, dEnergy = self.compute_function(
+            r_norm, k, lower_bounds, upper_bounds, negation_mask=None, compute_derivative=True
+        )
+        # gradient w.r.t subset
+        grad_unit = r / (r_norm.unsqueeze(-1) + 1e-8)
+        grad_subset = (dEnergy.unsqueeze(-1) * grad_unit) * energy_mask.unsqueeze(-1)
+
+        grad_atom = torch.zeros_like(coords)
+        grad_atom.scatter_add_(-2, ref_atom_index.unsqueeze(-1).expand_as(grad_subset), grad_subset)
+        return grad_atom
+
+
 class ContactPotentital(FlatBottomPotential, DistancePotential):
     def compute_args(self, feats, parameters):
         index = feats["contact_pair_index"][0]
@@ -771,6 +859,17 @@ def get_potentials(steering_args, boltz2=False):
     ):
         potentials.extend(
             [
+                CoreReferencePotential(
+                    parameters={
+                        "guidance_interval": 1,
+                        "guidance_weight": PiecewiseStepFunction(
+                                thresholds=[0.05, 0.25, 0.75], values=[0.0, 0.25, 0.5, 1]
+                            )
+                        if steering_args["contact_guidance_update"]
+                        else 0.0,
+                        "resampling_weight": 1.0,
+                    }
+                ),
                 ContactPotentital(
                     parameters={
                         "guidance_interval": 4,

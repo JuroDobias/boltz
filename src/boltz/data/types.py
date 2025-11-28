@@ -600,6 +600,19 @@ class TemplateInfo:
 
 
 @dataclass(frozen=True)
+class TemplateLigandInfo:
+    """Ligand template info."""
+
+    path: str
+    sdf: str
+    protein_id: str
+    ligand_id: str
+    template_id: Optional[str] = None
+    force: bool = False
+    threshold: float = 0.5
+
+
+@dataclass(frozen=True)
 class AffinityInfo:
     """AffinityInfo datatype."""
 
@@ -617,6 +630,7 @@ class Record(JSONSerializable):
     interfaces: list[InterfaceInfo]
     inference_options: Optional[InferenceOptions] = None
     templates: Optional[list[TemplateInfo]] = None
+    template_ligand: Optional["TemplateLigandInfo"] = None
     md: Optional[MDInfo] = None
     affinity: Optional[AffinityInfo] = None
 

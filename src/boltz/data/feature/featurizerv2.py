@@ -7,7 +7,9 @@ import numpy.typing as npt
 import rdkit.Chem.Descriptors
 import torch
 from numba import types
+from rdkit import Chem
 from rdkit.Chem import Mol
+import gemmi
 from scipy.spatial.distance import cdist
 from torch import Tensor, from_numpy
 from torch.nn.functional import one_hot
@@ -26,6 +28,7 @@ from boltz.data.types import (
     MSAResidue,
     MSASequence,
     TemplateInfo,
+    TemplateLigandInfo,
     Tokenized,
 )
 from boltz.model.modules.utils import center_random_augmentation
@@ -1838,6 +1841,235 @@ def process_template_features(
     return out
 
 
+def process_template_ligand_features(
+    data: Tokenized,
+    molecules: dict[str, Mol],
+) -> dict[str, torch.Tensor]:
+    """Process template ligand features."""
+    info: Optional[TemplateLigandInfo] = getattr(data.record, "template_ligand", None)
+    if info is None:
+        return {
+            "template_core_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_coords": torch.empty((1, 0, 3), dtype=torch.float32),
+            "template_core_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_align_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
+            "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
+            "fixed_atom_mask": torch.zeros(
+                (1, data.structure.atoms.shape[0]), dtype=torch.bool
+            ),
+            "fixed_atom_coords": torch.zeros(
+                (1, data.structure.atoms.shape[0], 3), dtype=torch.float32
+            ),
+        }
+
+    # Map chain names to asym_id and chain metadata
+    chain_name_to_asym = {c["name"]: c["asym_id"] for c in data.structure.chains}
+    if info.protein_id not in chain_name_to_asym or info.ligand_id not in chain_name_to_asym:
+        return {
+            "template_core_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_coords": torch.empty((1, 0, 3), dtype=torch.float32),
+            "template_core_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_align_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
+            "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
+        }
+
+    prot_asym = chain_name_to_asym[info.protein_id]
+    lig_asym = chain_name_to_asym[info.ligand_id]
+
+    # Load reference structure (PDB or CIF)
+    ref_struct = gemmi.read_structure(info.path)
+    ref_model = ref_struct[0]
+
+    # Build reference coordinate lookup: (chain, res_idx, atom_name) -> coord
+    ref_coords_lookup = {}
+    for chain in ref_model:
+        if info.template_id is not None and chain.name != info.template_id:
+            continue
+        for res in chain:
+            if len(res) == 0:
+                continue
+            try:
+                res_idx = int(res.seqid.num)
+            except Exception:
+                continue
+            for atom in res:
+                ref_coords_lookup[(chain.name, res_idx, atom.name.strip())] = (
+                    atom.pos.x,
+                    atom.pos.y,
+                    atom.pos.z,
+                )
+
+    atoms = data.structure.atoms
+    residues = data.structure.residues
+
+    ref_coords = []
+    ref_mask = []
+    align_mask = []
+    ref_atom_index = []
+
+    # Protein CB/CA
+    protein_tokens = [
+        t for t in data.tokens if t["asym_id"] == prot_asym
+    ]
+    name_to_atom_idx = {}
+    for res in residues:
+        # build name map per residue
+        start = res["atom_idx"]
+        end = start + res["atom_num"]
+        for i, a in enumerate(atoms[start:end], start):
+            name_to_atom_idx[(res["res_idx"] + 1, a["name"])] = i
+
+    for token in protein_tokens:
+        res_idx = token["res_idx"] + 1
+        atom_name = "CB"
+        # Gly uses CA
+        res_start = residues[token["res_idx"]]["atom_idx"]
+        res_end = res_start + residues[token["res_idx"]]["atom_num"]
+        res_atom_names = {a["name"] for a in atoms[res_start:res_end]}
+        if "CB" not in res_atom_names:
+            atom_name = "CA"
+        key = (info.template_id or info.protein_id, res_idx, atom_name)
+        if key not in ref_coords_lookup:
+            continue
+        if (res_idx, atom_name) not in name_to_atom_idx:
+            continue
+        ref_coords.append(ref_coords_lookup[key])
+        ref_mask.append(True)
+        align_mask.append(True)
+        ref_atom_index.append(name_to_atom_idx[(res_idx, atom_name)])
+
+    # Ligand core via atom names from SDF substructure match
+    if info.sdf:
+        sdf_supplier = Chem.SDMolSupplier(info.sdf, removeHs=False)
+        core = sdf_supplier[0] if sdf_supplier and len(sdf_supplier) > 0 else None
+        if core is None:
+            raise RuntimeError(f"[template] could not read core SDF '{info.sdf}'")
+        lig_tokens = [t for t in data.tokens if t["asym_id"] == lig_asym]
+        if len(lig_tokens) > 0:
+            lig_atom_names = {}
+            for lig_atom in lig_tokens:
+                atom_idx = lig_atom["atom_idx"]
+                atom_name = atoms[atom_idx]["name"]
+                lig_atom_names[atom_name] = atom_idx
+            res_name = lig_tokens[0]["res_name"]
+            lig_mol = molecules.get(res_name)
+            if lig_mol is not None:
+                matches = lig_mol.GetSubstructMatches(core)
+                best = None
+                best_rmsd = None
+                best_names = None
+                conf = core.GetConformer()
+                for match in matches:
+                    coords_core = []
+                    coords_model = []
+                    names = []
+                    valid = True
+                    for core_idx, lig_idx in enumerate(match):
+                        atom = lig_mol.GetAtomWithIdx(lig_idx)
+                        if not atom.HasProp("name"):
+                            valid = False
+                            break
+                        atom_name = atom.GetProp("name")
+                        print(atom_name)
+                        if atom_name not in lig_atom_names:
+                            valid = False
+                            break
+                        names.append(atom_name)
+                        coords_core.append(conf.GetAtomPosition(core_idx))
+                        coords_model.append(atoms[lig_atom_names[atom_name]]["coords"])
+                    if not valid or len(coords_core) == 0:
+                        continue
+                    coords_core_np = np.array([[p.x, p.y, p.z] for p in coords_core])
+                    coords_model_np = np.array(coords_model)
+                    diff = coords_core_np - coords_model_np
+                    rmsd = np.sqrt((diff**2).sum(axis=1).mean())
+                    if best_rmsd is None or rmsd < best_rmsd:
+                        best_rmsd = rmsd
+                        best = match
+                        best_names = names
+                if best is None:
+                    raise RuntimeError(
+                        "[template] no substructure match between core SDF and ligand chain "
+                        f"{info.ligand_id}"
+                    )
+                names_for_log = best_names
+                if names_for_log is None:
+                    # Fallback: derive names (or indices) from the best match
+                    names_for_log = []
+                    for _, lig_idx in enumerate(best):
+                        atom = lig_mol.GetAtomWithIdx(lig_idx)
+                        if atom.HasProp("name"):
+                            names_for_log.append(atom.GetProp("name"))
+                        else:
+                            names_for_log.append(f"idx_{lig_idx}")
+                print(  # noqa: T201
+                    "[template] ligand core match atom names "
+                    f"{names_for_log}"
+                )
+                conf = core.GetConformer()
+                for core_idx, lig_idx in enumerate(best):
+                    atom = lig_mol.GetAtomWithIdx(lig_idx)
+                    atom_name = atom.GetProp("name") if atom.HasProp("name") else None
+                    if atom_name is None or atom_name not in lig_atom_names:
+                        continue
+                    atom_pos = conf.GetAtomPosition(core_idx)
+                    ref_coords.append((atom_pos.x, atom_pos.y, atom_pos.z))
+                    ref_mask.append(True)
+                    align_mask.append(False)
+                    ref_atom_index.append(lig_atom_names[atom_name])
+
+    if len(ref_coords) == 0:
+        return {
+            "template_core_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_coords": torch.empty((1, 0, 3), dtype=torch.float32),
+            "template_core_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_align_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
+            "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
+            "fixed_atom_mask": torch.zeros(
+                (1, data.structure.atoms.shape[0]), dtype=torch.bool
+            ),
+            "fixed_atom_coords": torch.zeros(
+                (1, data.structure.atoms.shape[0], 3), dtype=torch.float32
+            ),
+        }
+
+    ref_coords_t = torch.tensor(ref_coords, dtype=torch.float32).unsqueeze(0)
+    ref_mask_t = torch.tensor(ref_mask, dtype=torch.bool).unsqueeze(0)
+    align_mask_t = torch.tensor(align_mask, dtype=torch.bool).unsqueeze(0)
+    ref_atom_index_t = torch.tensor(ref_atom_index, dtype=torch.long).unsqueeze(0)
+    thresholds = torch.full((1, len(ref_coords)), float(info.threshold), dtype=torch.float32)
+    index = torch.arange(len(ref_coords), dtype=torch.long).unsqueeze(0)
+
+    # Map atom indices back to token indices for gradient scatter
+    atom_to_token = torch.tensor(data.tokens["token_idx"], dtype=torch.long)
+    ref_token_index = ref_atom_index_t.clone()
+
+    fixed_mask = torch.zeros((1, data.structure.atoms.shape[0]), dtype=torch.bool)
+    fixed_coords = torch.zeros(
+        (1, data.structure.atoms.shape[0], 3), dtype=torch.float32
+    )
+    fixed_mask[0, ref_atom_index_t[0]] = True
+    fixed_coords[0, ref_atom_index_t[0]] = ref_coords_t[0]
+
+    return {
+        "template_core_index": index,
+        "template_core_coords": ref_coords_t,
+        "template_core_mask": ref_mask_t,
+        "template_core_align_mask": align_mask_t,
+        "template_core_threshold": thresholds,
+        "template_core_ref_atom_index": ref_atom_index_t,
+        "template_core_ref_token_index": ref_token_index,
+        "fixed_atom_mask": fixed_mask,
+        "fixed_atom_coords": fixed_coords,
+    }
+
+
 def process_symmetry_features(
     cropped: Tokenized, symmetries: dict
 ) -> dict[str, Tensor]:
@@ -2393,6 +2625,10 @@ class Boltz2Featurizer:
                 tdim=1,
                 num_tokens=num_tokens,
             )
+        template_core_features = process_template_ligand_features(
+            data=data,
+            molecules=molecules,
+        )
 
         # Compute symmetry features
         symmetry_features = {}
@@ -2436,6 +2672,7 @@ class Boltz2Featurizer:
             **msa_features,
             **msa_features_affinity,
             **template_features,
+            **template_core_features,
             **symmetry_features,
             **ensemble_features,
             **residue_constraint_features,

@@ -34,6 +34,7 @@ from boltz.model.modules.utils import (
 )
 from boltz.model.potentials.potentials import (
     ChiralAtomPotential,
+    CoreReferencePotential,
     DihedralConstraintPotential,
     PlanarBondPotential,
     StereoBondPotential,
@@ -330,7 +331,7 @@ class AtomDiffusion(Module):
                 (p for p in potentials if isinstance(p, DihedralConstraintPotential)),
                 None,
             )
-            has_dihedral_potential = dihedral_potential is not None
+            has_dihedral_potential = dihedral_potential is not None and dihedral_count > 0
             if not dihedral_debug_done:
                 print(  # noqa: T201
                     "[steering] dihedral potential present="
@@ -369,6 +370,15 @@ class AtomDiffusion(Module):
         num_sampling_steps = default(num_sampling_steps, self.num_sampling_steps)
         atom_mask = atom_mask.repeat_interleave(multiplicity, 0)
 
+        fixed_mask = None
+        fixed_coords = None
+        feats = network_condition_kwargs.get("feats", {})
+        if "fixed_atom_mask" in feats and "fixed_atom_coords" in feats:
+            fixed_mask = feats["fixed_atom_mask"].to(self.device).bool()
+            fixed_coords = feats["fixed_atom_coords"].to(self.device).float()
+            fixed_mask = fixed_mask.repeat_interleave(multiplicity, 0)
+            fixed_coords = fixed_coords.repeat_interleave(multiplicity, 0)
+
         shape = (*atom_mask.shape, 3)
 
         # get the schedule, which is returned as (sigma, gamma) tuple, and pair up with the next sigma and gamma
@@ -383,6 +393,9 @@ class AtomDiffusion(Module):
         # atom position is noise at the beginning
         init_sigma = sigmas[0]
         atom_coords = init_sigma * torch.randn(shape, device=self.device)
+        if fixed_mask is not None:
+            atom_coords = atom_coords.clone()
+            atom_coords[fixed_mask] = fixed_coords[fixed_mask]
         token_repr = None
         atom_coords_denoised = None
 
@@ -415,6 +428,9 @@ class AtomDiffusion(Module):
             steering_t = 1.0 - (step_idx / num_sampling_steps)
             noise_var = self.noise_scale**2 * (t_hat**2 - sigma_tm**2)
             eps = sqrt(noise_var) * torch.randn(shape, device=self.device)
+            if fixed_mask is not None:
+                eps = eps.clone()
+                eps[fixed_mask] = 0.0
             atom_coords_noisy = atom_coords + eps
 
             with torch.no_grad():
@@ -434,6 +450,8 @@ class AtomDiffusion(Module):
                         ),
                     )
                     atom_coords_denoised[sample_ids_chunk] = atom_coords_denoised_chunk
+                if fixed_mask is not None:
+                    atom_coords_denoised[fixed_mask] = fixed_coords[fixed_mask]
 
                 if has_dihedral_potential and dihedral_count > 0:
                     print(  # noqa: T201
@@ -460,24 +478,94 @@ class AtomDiffusion(Module):
                             f"{step_idx} angles(deg)={angles_deg[:5].tolist()} "
                             f"energy={energy[0].item():.4f}"
                         )
-                    # Stereochem potentials (chiral / stereo bond / planar)
-                    for potential in potentials:
-                        if not isinstance(
-                            potential,
-                            (
-                                ChiralAtomPotential,
-                                StereoBondPotential,
-                                PlanarBondPotential,
-                            ),
-                        ):
-                            continue
-                        params = potential.compute_parameters(steering_t)
-                        energy = potential.compute(
-                            atom_coords_denoised[:1], feats, params
+                # Stereochem potentials (chiral / stereo bond / planar)
+                for potential in potentials:
+                    if not isinstance(
+                        potential,
+                        (
+                            ChiralAtomPotential,
+                            StereoBondPotential,
+                            PlanarBondPotential,
+                        ),
+                    ):
+                        continue
+                    params = potential.compute_parameters(steering_t)
+                    energy = potential.compute(
+                        atom_coords_denoised[:1], feats, params
+                    )
+                    print(  # noqa: T201
+                        f"[steering] {potential.__class__.__name__} "
+                        f"step {step_idx} energy={energy[0].item():.4f}"
+                    )
+
+                # Template core RMSD logging (before guidance)
+                if (
+                    "template_core_ref_atom_index" in feats
+                    and feats["template_core_ref_atom_index"].shape[1] > 0
+                ):
+                    ref_atom_index = feats["template_core_ref_atom_index"][0].reshape(-1)
+                    ref_coords = feats["template_core_coords"][0].to(atom_coords_denoised.device)[0]
+                    energy_mask = feats["template_core_mask"][0].bool().reshape(-1)
+                    align_mask = feats["template_core_align_mask"][0].bool().reshape(-1)
+                    subset = atom_coords_denoised[:1].index_select(-2, ref_atom_index)
+                    if energy_mask.any():
+                        subset0 = subset[0]
+                        raw_rmsd = torch.sqrt(
+                            ((subset0[energy_mask] - ref_coords[energy_mask]) ** 2).sum(-1).mean()
+                        ).item()
+                        if align_mask.any():
+                            aligned_ref = weighted_rigid_align(
+                                ref_coords.unsqueeze(0).float(),
+                                subset.float(),
+                                align_mask,
+                                align_mask,
+                            ).squeeze(0)
+                        else:
+                            aligned_ref = ref_coords
+                        aligned_rmsd = torch.sqrt(
+                            ((subset0[energy_mask] - aligned_ref[energy_mask]) ** 2)
+                            .sum(-1)
+                            .mean()
+                        ).item()
+                        prot_mask = energy_mask & align_mask
+                        lig_mask = energy_mask & (~align_mask)
+                        prot_rmsd_raw = (
+                            torch.sqrt(
+                                ((subset0[prot_mask] - ref_coords[prot_mask]) ** 2).sum(-1).mean()
+                            ).item()
+                            if prot_mask.any()
+                            else None
                         )
+                        lig_rmsd_raw = (
+                            torch.sqrt(
+                                ((subset0[lig_mask] - ref_coords[lig_mask]) ** 2).sum(-1).mean()
+                            ).item()
+                            if lig_mask.any()
+                            else None
+                        )
+                        prot_rmsd_aligned = (
+                            torch.sqrt(
+                                ((subset0[prot_mask] - aligned_ref[prot_mask]) ** 2).sum(-1).mean()
+                            ).item()
+                            if prot_mask.any()
+                            else None
+                        )
+                        lig_rmsd_aligned = (
+                            torch.sqrt(
+                                ((subset0[lig_mask] - aligned_ref[lig_mask]) ** 2).sum(-1).mean()
+                            ).item()
+                            if lig_mask.any()
+                            else None
+                        )
+                        if not lig_mask.any():
+                            print("[template] no ligand atoms in template_core_mask (cropped or match failed)")  # noqa: T201
                         print(  # noqa: T201
-                            f"[steering] {potential.__class__.__name__} "
-                            f"step {step_idx} energy={energy[0].item():.4f}"
+                            "[template] step "
+                            f"{step_idx} prot_raw={prot_rmsd_raw if prot_rmsd_raw is not None else 'NA'} "
+                            f"prot_aligned={prot_rmsd_aligned if prot_rmsd_aligned is not None else 'NA'} "
+                            f"lig_raw={lig_rmsd_raw if lig_rmsd_raw is not None else 'NA'} "
+                            f"lig_aligned={lig_rmsd_aligned if lig_rmsd_aligned is not None else 'NA'} "
+                            f"raw={raw_rmsd:.3f} aligned={aligned_rmsd:.3f}"
                         )
 
                 if steering_args["fk_steering"] and (
@@ -548,7 +636,9 @@ class AtomDiffusion(Module):
                                     parameters,
                                 )
                         guidance_update -= energy_gradient
-                        if has_dihedral_potential and dihedral_potential is not None:
+                        if fixed_mask is not None:
+                            guidance_update[fixed_mask] = 0.0
+                        if has_dihedral_potential and dihedral_potential is not None and dihedral_count > 0:
                             params = dihedral_potential.compute_parameters(steering_t)
                             angles = dihedral_potential.compute_variable(
                                 atom_coords_denoised[:1] + guidance_update[:1],
@@ -571,6 +661,77 @@ class AtomDiffusion(Module):
                                 f"energy={energy[0].item():.4f}"
                             )
                     atom_coords_denoised += guidance_update
+                    if fixed_mask is not None:
+                        atom_coords_denoised[fixed_mask] = fixed_coords[fixed_mask]
+                    # Template RMSD after guidance
+                    if (
+                        "template_core_ref_atom_index" in feats
+                        and feats["template_core_ref_atom_index"].shape[1] > 0
+                    ):
+                        ref_atom_index = feats["template_core_ref_atom_index"][0].reshape(-1)
+                        ref_coords = feats["template_core_coords"][0].to(atom_coords_denoised.device)[0]
+                        energy_mask = feats["template_core_mask"][0].bool().reshape(-1)
+                        align_mask = feats["template_core_align_mask"][0].bool().reshape(-1)
+                        subset = atom_coords_denoised[:1].index_select(-2, ref_atom_index)
+                        if energy_mask.any():
+                            subset0 = subset[0]
+                            raw_rmsd = torch.sqrt(
+                                ((subset0[energy_mask] - ref_coords[energy_mask]) ** 2).sum(-1).mean()
+                            ).item()
+                            if align_mask.any():
+                                aligned_ref = weighted_rigid_align(
+                                    ref_coords.unsqueeze(0).float(),
+                                    subset.float(),
+                                    align_mask,
+                                    align_mask,
+                                ).squeeze(0)
+                            else:
+                                aligned_ref = ref_coords
+                            aligned_rmsd = torch.sqrt(
+                                ((subset0[energy_mask] - aligned_ref[energy_mask]) ** 2)
+                                .sum(-1)
+                                .mean()
+                            ).item()
+                            prot_mask = energy_mask & align_mask
+                            lig_mask = energy_mask & (~align_mask)
+                            prot_rmsd_raw = (
+                                torch.sqrt(
+                                    ((subset0[prot_mask] - ref_coords[prot_mask]) ** 2).sum(-1).mean()
+                                ).item()
+                                if prot_mask.any()
+                                else None
+                            )
+                            lig_rmsd_raw = (
+                                torch.sqrt(
+                                    ((subset0[lig_mask] - ref_coords[lig_mask]) ** 2).sum(-1).mean()
+                                ).item()
+                                if lig_mask.any()
+                                else None
+                            )
+                            prot_rmsd_aligned = (
+                                torch.sqrt(
+                                    ((subset0[prot_mask] - aligned_ref[prot_mask]) ** 2).sum(-1).mean()
+                                ).item()
+                                if prot_mask.any()
+                                else None
+                            )
+                            lig_rmsd_aligned = (
+                                torch.sqrt(
+                                    ((subset0[lig_mask] - aligned_ref[lig_mask]) ** 2).sum(-1).mean()
+                                ).item()
+                                if lig_mask.any()
+                                else None
+                            )
+                            if not lig_mask.any():
+                                print("[template] no ligand atoms in template_core_mask (cropped or match failed)")  # noqa: T201
+                            print(  # noqa: T201
+                                "[template] gd_step "
+                                f"{guidance_step} prot_raw={prot_rmsd_raw if prot_rmsd_raw is not None else 'NA'} "
+                                f"prot_aligned={prot_rmsd_aligned if prot_rmsd_aligned is not None else 'NA'} "
+                                f"lig_raw={lig_rmsd_raw if lig_rmsd_raw is not None else 'NA'} "
+                                f"lig_aligned={lig_rmsd_aligned if lig_rmsd_aligned is not None else 'NA'} "
+                                f"raw={raw_rmsd:.3f} aligned={aligned_rmsd:.3f}"
+                            )
                     scaled_guidance_update = (
                         guidance_update
                         * -1
@@ -615,6 +776,9 @@ class AtomDiffusion(Module):
                         ]
                     if token_repr is not None:
                         token_repr = token_repr[resample_indices]
+                    if fixed_mask is not None:
+                        fixed_mask = fixed_mask[resample_indices]
+                        fixed_coords = fixed_coords[resample_indices]
 
             if self.alignment_reverse_diff:
                 with torch.autocast("cuda", enabled=False):
@@ -632,7 +796,9 @@ class AtomDiffusion(Module):
                 atom_coords_noisy + step_scale * (sigma_t - t_hat) * denoised_over_sigma
             )
 
-            atom_coords = atom_coords_next
+                    atom_coords = atom_coords_next
+                    if fixed_mask is not None:
+                        atom_coords[fixed_mask] = fixed_coords[fixed_mask]
 
         return dict(sample_atom_coords=atom_coords, diff_token_repr=token_repr)
 

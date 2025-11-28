@@ -48,6 +48,7 @@ from boltz.data.types import (
     StructureV2,
     Target,
     TemplateInfo,
+    TemplateLigandInfo,
 )
 
 ####################################################################################################
@@ -2165,6 +2166,43 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         msg = "Templates are not supported in Boltz 1.0!"
         raise ValueError(msg)
 
+    template_ligand_info = None
+    template_ligand_schema = schema.get("template_ligand", None)
+    if template_ligand_schema is not None:
+        if not boltz_2:
+            msg = "Template ligand is only supported in Boltz 2.0!"
+            raise ValueError(msg)
+        protein_id = template_ligand_schema.get("protein_id") or template_ligand_schema.get("protein_chain")
+        ligand_id = template_ligand_schema.get("ligand_id") or template_ligand_schema.get("ligand_chain")
+        if protein_id is None or ligand_id is None:
+            msg = "template_ligand must specify protein_id and ligand_id"
+            raise ValueError(msg)
+        if chains[ligand_id].type != const.chain_type_ids["NONPOLYMER"]:
+            msg = "template_ligand.ligand_id must reference a nonpolymer chain"
+            raise ValueError(msg)
+        threshold = float(template_ligand_schema.get("threshold", 0.5))
+        force = bool(template_ligand_schema.get("force", False))
+        template_id = template_ligand_schema.get("template_id", None)
+
+        pdb_path = template_ligand_schema.get("pdb", None)
+        cif_path = template_ligand_schema.get("cif", None)
+        if pdb_path is None and cif_path is None:
+            msg = "template_ligand must specify either pdb or cif path"
+            raise ValueError(msg)
+        if pdb_path is not None and cif_path is not None:
+            msg = "template_ligand: specify only one of pdb or cif, not both"
+            raise ValueError(msg)
+        template_path = pdb_path if pdb_path is not None else cif_path
+        template_ligand_info = TemplateLigandInfo(
+            path=str(template_path),
+            sdf=str(template_ligand_schema.get("sdf", "")),
+            protein_id=protein_id,
+            ligand_id=ligand_id,
+            template_id=template_id,
+            force=force,
+            threshold=threshold,
+        )
+
     templates = {}
     template_records = []
     for template in template_schema:
@@ -2375,6 +2413,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         interfaces=[],
         inference_options=options,
         templates=template_records,
+        template_ligand=template_ligand_info,
         affinity=affinity_info,
     )
 
