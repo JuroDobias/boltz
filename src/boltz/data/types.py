@@ -610,6 +610,7 @@ class TemplateLigandInfo:
     template_id: Optional[str] = None
     force: bool = False
     threshold: float = 0.5
+    potential: str = "harmonic"
 
 
 @dataclass(frozen=True)

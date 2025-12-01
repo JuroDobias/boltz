@@ -2183,6 +2183,10 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         threshold = float(template_ligand_schema.get("threshold", 0.5))
         force = bool(template_ligand_schema.get("force", False))
         template_id = template_ligand_schema.get("template_id", None)
+        potential = template_ligand_schema.get("potential", "harmonic").lower()
+        if potential not in {"harmonic", "linear"}:
+            msg = "template_ligand.potential must be 'harmonic' or 'linear'"
+            raise ValueError(msg)
 
         pdb_path = template_ligand_schema.get("pdb", None)
         cif_path = template_ligand_schema.get("cif", None)
@@ -2201,6 +2205,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             template_id=template_id,
             force=force,
             threshold=threshold,
+            potential=potential,
         )
 
     templates = {}

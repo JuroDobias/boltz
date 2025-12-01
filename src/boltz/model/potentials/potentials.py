@@ -696,6 +696,11 @@ class CoreReferencePotential(FlatBottomPotential):
         k, lower_bounds, upper_bounds = args
         align_mask, energy_mask, ref_coords, ref_atom_index, _ = align_args
         ref_atom_index = ref_atom_index.reshape(-1)
+        potential_type = (
+            int(feats.get("template_core_potential", torch.tensor([0]))[0].item())
+            if isinstance(feats.get("template_core_potential", None), torch.Tensor)
+            else 0
+        )
 
         subset = coords.index_select(-2, ref_atom_index)
         aligned_ref = weighted_rigid_align(
@@ -707,10 +712,19 @@ class CoreReferencePotential(FlatBottomPotential):
         r = subset - aligned_ref
         r_norm = torch.linalg.norm(r, dim=-1)
         r_norm = r_norm * energy_mask
-
-        energy = self.compute_function(
-            r_norm, k, lower_bounds, upper_bounds, negation_mask=None, compute_derivative=False
-        )
+        if potential_type == 1:
+            energy = torch.zeros_like(r_norm)
+            pos_over = r_norm > upper_bounds
+            energy[pos_over] = k[pos_over] * (r_norm[pos_over] - upper_bounds[pos_over])
+        else:
+            energy = self.compute_function(
+                r_norm,
+                k,
+                lower_bounds,
+                upper_bounds,
+                negation_mask=None,
+                compute_derivative=False,
+            )
         return energy.sum(dim=tuple(range(1, energy.dim())))
 
     def compute_gradient(self, coords, feats, parameters):
@@ -720,6 +734,11 @@ class CoreReferencePotential(FlatBottomPotential):
         k, lower_bounds, upper_bounds = args
         align_mask, energy_mask, ref_coords, ref_atom_index, ref_token_index = align_args
         ref_atom_index = ref_atom_index.reshape(-1)
+        potential_type = (
+            int(feats.get("template_core_potential", torch.tensor([0]))[0].item())
+            if isinstance(feats.get("template_core_potential", None), torch.Tensor)
+            else 0
+        )
 
         subset = coords.index_select(-2, ref_atom_index).clone().requires_grad_(True)
         aligned_ref = weighted_rigid_align(
@@ -731,9 +750,21 @@ class CoreReferencePotential(FlatBottomPotential):
         r = subset - aligned_ref
         r_norm = torch.linalg.norm(r, dim=-1)
         r_norm = r_norm * energy_mask
-        energy, dEnergy = self.compute_function(
-            r_norm, k, lower_bounds, upper_bounds, negation_mask=None, compute_derivative=True
-        )
+        if potential_type == 1:
+            energy = torch.zeros_like(r_norm)
+            dEnergy = torch.zeros_like(r_norm)
+            pos_over = r_norm > upper_bounds
+            energy[pos_over] = k[pos_over] * (r_norm[pos_over] - upper_bounds[pos_over])
+            dEnergy[pos_over] = k[pos_over]
+        else:
+            energy, dEnergy = self.compute_function(
+                r_norm,
+                k,
+                lower_bounds,
+                upper_bounds,
+                negation_mask=None,
+                compute_derivative=True,
+            )
         # gradient w.r.t subset
         grad_unit = r / (r_norm.unsqueeze(-1) + 1e-8)
         grad_subset = (dEnergy.unsqueeze(-1) * grad_unit) * energy_mask.unsqueeze(-1)
@@ -863,7 +894,7 @@ def get_potentials(steering_args, boltz2=False):
                     parameters={
                         "guidance_interval": 1,
                         "guidance_weight": PiecewiseStepFunction(
-                                thresholds=[0.05, 0.25, 0.75], values=[0.0, 0.25, 0.5, 1]
+                                thresholds=[0.25, 0.75], values=[0.0, 0.5, 1.0]
                             )
                         if steering_args["contact_guidance_update"]
                         else 0.0,
@@ -875,7 +906,7 @@ def get_potentials(steering_args, boltz2=False):
                         "guidance_interval": 4,
                         "guidance_weight": (
                             PiecewiseStepFunction(
-                                thresholds=[0.05, 0.25, 0.75], values=[0.0, 0.25, 0.5, 1]
+                                thresholds=[0.25, 0.75], values=[0.0, 0.5, 1.0]
                             )
                             if steering_args["contact_guidance_update"]
                             else 0.0
