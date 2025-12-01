@@ -713,9 +713,13 @@ class CoreReferencePotential(FlatBottomPotential):
         r_norm = torch.linalg.norm(r, dim=-1)
         r_norm = r_norm * energy_mask
         if potential_type == 1:
+            upper_expanded = upper_bounds.view(1, -1).expand_as(r_norm)
+            k_expanded = k.view(1, -1).expand_as(r_norm)
             energy = torch.zeros_like(r_norm)
-            pos_over = r_norm > upper_bounds
-            energy[pos_over] = k[pos_over] * (r_norm[pos_over] - upper_bounds[pos_over])
+            pos_over = r_norm > upper_expanded
+            energy[pos_over] = k_expanded[pos_over] * (
+                r_norm[pos_over] - upper_expanded[pos_over]
+            )
         else:
             energy = self.compute_function(
                 r_norm,
@@ -751,11 +755,15 @@ class CoreReferencePotential(FlatBottomPotential):
         r_norm = torch.linalg.norm(r, dim=-1)
         r_norm = r_norm * energy_mask
         if potential_type == 1:
+            upper_expanded = upper_bounds.view(1, -1).expand_as(r_norm)
+            k_expanded = k.view(1, -1).expand_as(r_norm)
             energy = torch.zeros_like(r_norm)
             dEnergy = torch.zeros_like(r_norm)
-            pos_over = r_norm > upper_bounds
-            energy[pos_over] = k[pos_over] * (r_norm[pos_over] - upper_bounds[pos_over])
-            dEnergy[pos_over] = k[pos_over]
+            pos_over = r_norm > upper_expanded
+            energy[pos_over] = k_expanded[pos_over] * (
+                r_norm[pos_over] - upper_expanded[pos_over]
+            )
+            dEnergy[pos_over] = k_expanded[pos_over]
         else:
             energy, dEnergy = self.compute_function(
                 r_norm,
@@ -892,9 +900,9 @@ def get_potentials(steering_args, boltz2=False):
             [
                 CoreReferencePotential(
                     parameters={
-                        "guidance_interval": 1,
+                        "guidance_interval": 4,
                         "guidance_weight": PiecewiseStepFunction(
-                                thresholds=[0.25, 0.75], values=[0.0, 0.5, 1.0]
+                                thresholds=[0.25, 0.75], values=[1, 1, 1]
                             )
                         if steering_args["contact_guidance_update"]
                         else 0.0,
