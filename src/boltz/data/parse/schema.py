@@ -22,6 +22,8 @@ from boltz.data.parse.mmcif import parse_mmcif
 from boltz.data.parse.pdb import parse_pdb
 
 from boltz.data.types import (
+    AlignedLigandSDFOutput,
+    AlignToTemplateOutput,
     AffinityInfo,
     Atom,
     AtomV2,
@@ -35,6 +37,7 @@ from boltz.data.types import (
     Ensemble,
     InferenceOptions,
     Interface,
+    OutputOptions,
     PlanarBondConstraint,
     PlanarRing5Constraint,
     PlanarRing6Constraint,
@@ -1175,6 +1178,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
     # First group items that have the same type, sequence and modifications
     items_to_group = {}
     chain_name_to_entity_type = {}
+    chain_name_to_ligand_smiles = {}
 
     for item in schema["sequences"]:
         # Get entity type
@@ -1213,6 +1217,10 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         chain_names = [chain_names] if isinstance(chain_names, str) else chain_names
         for chain_name in chain_names:
             chain_name_to_entity_type[chain_name] = entity_type
+            if entity_type == "ligand" and ("smiles" in item[entity_type]):
+                chain_name_to_ligand_smiles[chain_name] = str(
+                    item[entity_type]["smiles"]
+                )
 
     # Check if any affinity ligand is present
     affinity_ligands = set()
@@ -2208,6 +2216,117 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             potential=potential,
         )
 
+    output_options = None
+    output_schema = schema.get("output", None)
+    if output_schema is not None:
+        align_to_template = None
+        aligned_ligand_sdf = None
+
+        align_schema = output_schema.get("align_to_template", None)
+        if align_schema is not None:
+            pdb_path = align_schema.get("pdb", None)
+            cif_path = align_schema.get("cif", None)
+            if pdb_path is None and cif_path is None:
+                msg = "output.align_to_template must specify either pdb or cif path"
+                raise ValueError(msg)
+            if pdb_path is not None and cif_path is not None:
+                msg = (
+                    "output.align_to_template: specify only one of pdb or cif, not both"
+                )
+                raise ValueError(msg)
+            template_path = pdb_path if pdb_path is not None else cif_path
+            atom = str(align_schema.get("atom", "CA")).strip().upper()
+            if atom != "CA":
+                msg = "output.align_to_template.atom currently supports only 'CA'"
+                raise ValueError(msg)
+            raw_chain_map = align_schema.get("chain_map", None)
+            chain_map = None
+            if raw_chain_map is not None:
+                if not isinstance(raw_chain_map, dict):
+                    msg = "output.align_to_template.chain_map must be a mapping"
+                    raise ValueError(msg)
+                chain_map = {}
+                for query_chain, template_chain in raw_chain_map.items():
+                    chain_map[str(query_chain)] = str(template_chain)
+            align_to_template = AlignToTemplateOutput(
+                path=str(template_path),
+                chain_map=chain_map,
+                atom=atom,
+            )
+
+        sdf_schema = output_schema.get("aligned_ligand_sdf", None)
+        if sdf_schema is not None:
+            enabled = bool(sdf_schema.get("enabled", False))
+            ligand_id = sdf_schema.get("ligand_id", None)
+            export_mode = str(sdf_schema.get("export", "all")).lower()
+            if export_mode not in {"all", "top1", "topk"}:
+                msg = "output.aligned_ligand_sdf.export must be one of all/top1/topk"
+                raise ValueError(msg)
+            top_k = sdf_schema.get("top_k", None)
+            if export_mode == "topk":
+                if top_k is None:
+                    msg = (
+                        "output.aligned_ligand_sdf.top_k is required when export is topk"
+                    )
+                    raise ValueError(msg)
+                top_k = int(top_k)
+                if top_k <= 0:
+                    msg = "output.aligned_ligand_sdf.top_k must be positive"
+                    raise ValueError(msg)
+            add_hydrogens = bool(sdf_schema.get("add_hydrogens", True))
+            chemistry_source = str(
+                sdf_schema.get("chemistry_source", "smiles_first_fallback")
+            ).lower()
+            if chemistry_source not in {"smiles_first_fallback"}:
+                msg = (
+                    "output.aligned_ligand_sdf.chemistry_source currently supports only "
+                    "'smiles_first_fallback'"
+                )
+                raise ValueError(msg)
+            file_pattern = str(
+                sdf_schema.get(
+                    "file_pattern",
+                    "{record}_model_{rank}_{ligand}.sdf",
+                )
+            )
+            if enabled and ligand_id is None:
+                msg = "output.aligned_ligand_sdf.ligand_id is required when enabled=true"
+                raise ValueError(msg)
+            if ligand_id is not None:
+                ligand_id = str(ligand_id)
+                if ligand_id not in chains:
+                    msg = (
+                        "output.aligned_ligand_sdf.ligand_id must reference a chain from "
+                        "the input"
+                    )
+                    raise ValueError(msg)
+                if chains[ligand_id].type != const.chain_type_ids["NONPOLYMER"]:
+                    msg = (
+                        "output.aligned_ligand_sdf.ligand_id must reference a nonpolymer "
+                        "chain"
+                    )
+                    raise ValueError(msg)
+
+            aligned_ligand_sdf = AlignedLigandSDFOutput(
+                enabled=enabled,
+                ligand_id=ligand_id,
+                export=export_mode,
+                top_k=top_k,
+                add_hydrogens=add_hydrogens,
+                chemistry_source=chemistry_source,
+                file_pattern=file_pattern,
+                smiles=(
+                    chain_name_to_ligand_smiles.get(ligand_id)
+                    if ligand_id is not None
+                    else None
+                ),
+            )
+
+        output_options = OutputOptions(
+            align_to_template=align_to_template,
+            aligned_ligand_sdf=aligned_ligand_sdf,
+        )
+
     templates = {}
     template_records = []
     for template in template_schema:
@@ -2419,6 +2538,7 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         inference_options=options,
         templates=template_records,
         template_ligand=template_ligand_info,
+        output_options=output_options,
         affinity=affinity_info,
     )
 

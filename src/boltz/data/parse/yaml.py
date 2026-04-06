@@ -64,5 +64,26 @@ def parse_yaml(
     with path.open("r") as file:
         data = yaml.safe_load(file)
 
+    # Resolve output alignment template paths relative to the YAML file location.
+    output = data.get("output") if isinstance(data, dict) else None
+    if isinstance(output, dict):
+        align = output.get("align_to_template")
+        if isinstance(align, dict):
+            for key in ("pdb", "cif"):
+                raw = align.get(key)
+                if raw:
+                    p = Path(str(raw))
+                    if not p.is_absolute():
+                        align[key] = str((path.parent / p).resolve())
+
+    template_ligand = data.get("template_ligand") if isinstance(data, dict) else None
+    if isinstance(template_ligand, dict):
+        for key in ("pdb", "cif", "sdf"):
+            raw = template_ligand.get(key)
+            if raw:
+                p = Path(str(raw))
+                if not p.is_absolute():
+                    template_ligand[key] = str((path.parent / p).resolve())
+
     name = path.stem
     return parse_boltz_schema(name, data, ccd, mol_dir, boltz2)

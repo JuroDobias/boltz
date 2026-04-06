@@ -60,6 +60,19 @@ templates:
 properties:
     - affinity:
         binder: CHAIN_ID
+output:
+    align_to_template:
+        pdb: TEMPLATE_PDB_PATH  # or cif
+        chain_map: {A: A}       # optional
+        atom: CA                # optional, default CA
+    aligned_ligand_sdf:
+        enabled: true
+        ligand_id: CHAIN_ID
+        export: all             # all | top1 | topk
+        top_k: 5                # required when export=topk
+        add_hydrogens: true
+        chemistry_source: smiles_first_fallback
+        file_pattern: "{record}_model_{rank}_{ligand}.sdf"
 
 ```
 
@@ -102,6 +115,15 @@ For any template you provide, you can also specify a `force` flag which will use
 
 ### Properties (affinity)
 `properties` is an optional field that allows you to specify whether you want to compute the affinity. If enabled, you must also provide the chain_id corresponding to the small molecule against which the affinity will be computed. Only one single small molecule can be specified for affinity computation. It must be a ligand chain (not a protein, DNA or RNA) and has to be at most 128 atoms counting heavy atoms and hydrogens kept by `RDKit RemoveHs`, however, we do not recommend running the affinity module with ligands significantly larger than 56 atoms (counted as above, limit set during training). At this point, Boltz only supports the computation of affinity of small molecules to protein targets, if ran with an RNA/DNA/co-factor target, the code will not crash but the output will be unreliable.
+
+### Output postprocessing
+`output` is optional and controls postprocessing exports.
+
+* `align_to_template`: aligns each predicted complex to a template frame using protein `CA` atoms. Provide exactly one of `pdb` or `cif`. Optional `chain_map` maps input chain ids to template chain ids.
+* `aligned_ligand_sdf`: exports aligned ligand coordinates into SDF.
+  * `ligand_id` selects the ligand chain from your YAML.
+  * `chemistry_source: smiles_first_fallback` means the exporter first attempts to assign bond orders from the input SMILES (if available), then falls back to the parsed ligand molecule.
+  * `add_hydrogens: true` adds explicit hydrogens with coordinates before SDF write.
 
 
 ### Example

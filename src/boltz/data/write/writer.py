@@ -1,14 +1,19 @@
 import json
+import pickle
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 import numpy as np
 import torch
 from pytorch_lightning import LightningModule, Trainer
 from pytorch_lightning.callbacks import BasePredictionWriter
+from rdkit import Chem
+from rdkit.Chem import AllChem
 from torch import Tensor
 
+from boltz.data import const
+from boltz.data.parse.template_reader import load_template_ca_by_chain
 from boltz.data.types import Coords, Interface, Record, Structure, StructureV2
 from boltz.data.write.mmcif import to_mmcif
 from boltz.data.write.pdb import to_pdb
@@ -24,6 +29,7 @@ class BoltzWriter(BasePredictionWriter):
         output_format: Literal["pdb", "mmcif"] = "mmcif",
         boltz2: bool = False,
         write_embeddings: bool = False,
+        extra_mols_dir: Optional[str] = None,
     ) -> None:
         """Initialize the writer.
 
@@ -45,6 +51,194 @@ class BoltzWriter(BasePredictionWriter):
         self.boltz2 = boltz2
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.write_embeddings = write_embeddings
+        self.extra_mols_dir = Path(extra_mols_dir) if extra_mols_dir is not None else None
+        self._template_cache: dict[str, dict[str, dict[int, np.ndarray]]] = {}
+
+    def _load_template_ca_coords(self, template_path: str) -> dict[str, dict[int, np.ndarray]]:
+        cached = self._template_cache.get(template_path)
+        if cached is not None:
+            return cached
+        ca_by_chain = load_template_ca_by_chain(template_path)
+        self._template_cache[template_path] = ca_by_chain
+        return ca_by_chain
+
+    def _kabsch(self, src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        src_centroid = src.mean(axis=0)
+        dst_centroid = dst.mean(axis=0)
+        src_centered = src - src_centroid
+        dst_centered = dst - dst_centroid
+        cov = src_centered.T @ dst_centered
+        u, _, vt = np.linalg.svd(cov)
+        rot = vt.T @ u.T
+        if np.linalg.det(rot) < 0:
+            vt[-1, :] *= -1
+            rot = vt.T @ u.T
+        trans = dst_centroid - (src_centroid @ rot)
+        return rot.astype(np.float32), trans.astype(np.float32)
+
+    def _align_coords_to_template(
+        self,
+        coords: np.ndarray,
+        structure: Structure,
+        chain_info: list,
+        align_opts,
+    ) -> np.ndarray:
+        template_ca = self._load_template_ca_coords(align_opts.path)
+        chain_name_to_idx = {
+            info.chain_name: idx for idx, info in enumerate(chain_info)
+        }
+        query_pts = []
+        template_pts = []
+        chain_map = align_opts.chain_map or {}
+
+        for info in chain_info:
+            chain_name = info.chain_name
+            chain_idx = chain_name_to_idx[chain_name]
+            chain = structure.chains[chain_idx]
+            if int(chain["mol_type"]) != const.chain_type_ids["PROTEIN"]:
+                continue
+            template_chain = chain_map.get(chain_name, chain_name)
+            if template_chain not in template_ca:
+                continue
+            chain_residues = structure.residues[
+                chain["res_idx"] : chain["res_idx"] + chain["res_num"]
+            ]
+            for chain_pos, residue in enumerate(chain_residues, start=1):
+                atom_start = residue["atom_idx"]
+                atom_end = atom_start + residue["atom_num"]
+                ca_idx = None
+                for atom_idx in range(atom_start, atom_end):
+                    if str(structure.atoms[atom_idx]["name"]).strip().upper() == "CA":
+                        ca_idx = atom_idx
+                        break
+                if ca_idx is None:
+                    continue
+                res_num = int(residue["res_idx"]) + 1
+                template_coord = template_ca[template_chain].get(res_num)
+                if template_coord is None:
+                    template_coord = template_ca[template_chain].get(chain_pos)
+                if template_coord is None:
+                    continue
+                query_pts.append(coords[ca_idx])
+                template_pts.append(template_coord)
+
+        if len(query_pts) < 3:
+            return coords
+
+        query_arr = np.asarray(query_pts, dtype=np.float32)
+        template_arr = np.asarray(template_pts, dtype=np.float32)
+        rot, trans = self._kabsch(query_arr, template_arr)
+        return (coords @ rot) + trans
+
+    def _load_extra_mols(self, record_id: str) -> dict:
+        if self.extra_mols_dir is None:
+            return {}
+        extra_mol_path = self.extra_mols_dir / f"{record_id}.pkl"
+        if not extra_mol_path.exists():
+            return {}
+        with extra_mol_path.open("rb") as handle:
+            return pickle.load(handle)  # noqa: S301
+
+    def _select_export_ranks(self, export_cfg, n_models: int) -> set[int]:
+        mode = export_cfg.export
+        if mode == "all":
+            return set(range(n_models))
+        if mode == "top1":
+            return {0}
+        if mode == "topk":
+            assert export_cfg.top_k is not None
+            return set(range(min(int(export_cfg.top_k), n_models)))
+        return set()
+
+    def _write_aligned_ligand_sdf(
+        self,
+        struct_dir: Path,
+        record,
+        structure: Structure,
+        chain_info: list,
+        model_rank: int,
+        export_cfg,
+        extra_mols: dict,
+    ) -> None:
+        if not export_cfg.enabled or export_cfg.ligand_id is None:
+            return
+
+        lig_chain_idx = None
+        for idx, info in enumerate(chain_info):
+            if info.chain_name == export_cfg.ligand_id:
+                lig_chain_idx = idx
+                break
+        if lig_chain_idx is None:
+            return
+
+        lig_chain = structure.chains[lig_chain_idx]
+        atom_start = lig_chain["atom_idx"]
+        atom_end = atom_start + lig_chain["atom_num"]
+        residues = structure.residues[
+            lig_chain["res_idx"] : lig_chain["res_idx"] + lig_chain["res_num"]
+        ]
+        if len(residues) == 0:
+            return
+        res_name = str(residues[0]["name"])
+        ref_mol = extra_mols.get(res_name)
+        if ref_mol is None:
+            return
+
+        predicted_coords_by_name = {}
+        for atom_idx in range(atom_start, atom_end):
+            atom_name = str(structure.atoms[atom_idx]["name"]).strip()
+            predicted_coords_by_name[atom_name] = np.asarray(
+                structure.atoms[atom_idx]["coords"], dtype=np.float64
+            )
+
+        base_mol = Chem.Mol(ref_mol)
+        if base_mol.GetNumConformers() == 0:
+            conformer = Chem.Conformer(base_mol.GetNumAtoms())
+            base_mol.AddConformer(conformer, assignId=True)
+        conf = base_mol.GetConformer()
+        for atom in base_mol.GetAtoms():
+            atom_name = atom.GetProp("name") if atom.HasProp("name") else None
+            if atom_name is None or atom_name not in predicted_coords_by_name:
+                continue
+            x, y, z = predicted_coords_by_name[atom_name]
+            conf.SetAtomPosition(atom.GetIdx(), (float(x), float(y), float(z)))
+
+        export_mol = base_mol
+        smiles = export_cfg.smiles
+        if smiles:
+            template = Chem.MolFromSmiles(smiles)
+            if template is not None:
+                try:
+                    template_no_h = Chem.RemoveHs(template)
+                    base_no_h = Chem.RemoveHs(base_mol)
+                    assigned = AllChem.AssignBondOrdersFromTemplate(
+                        template_no_h,
+                        base_no_h,
+                    )
+                    if assigned.GetNumAtoms() == base_no_h.GetNumAtoms():
+                        conf_base = base_no_h.GetConformer()
+                        conf_assigned = Chem.Conformer(assigned.GetNumAtoms())
+                        for atom_idx in range(assigned.GetNumAtoms()):
+                            pos = conf_base.GetAtomPosition(atom_idx)
+                            conf_assigned.SetAtomPosition(atom_idx, pos)
+                        assigned.RemoveAllConformers()
+                        assigned.AddConformer(conf_assigned, assignId=True)
+                    export_mol = assigned
+                except Exception:
+                    export_mol = base_mol
+
+        if export_cfg.add_hydrogens:
+            export_mol = Chem.AddHs(export_mol, addCoords=True)
+
+        filename = export_cfg.file_pattern.format(
+            record=record.id,
+            rank=model_rank,
+            ligand=export_cfg.ligand_id,
+        )
+        out_path = struct_dir / filename
+        writer = Chem.SDWriter(str(out_path))
+        writer.write(export_mol)
+        writer.close()
 
     def write_on_batch_end(
         self,
@@ -96,12 +290,59 @@ class BoltzWriter(BasePredictionWriter):
             # Remove masked chains completely
             structure = structure.remove_invalid_chains()
 
+            # Update chain info
+            chain_info = []
+            for chain in structure.chains:
+                old_chain_idx = chain_map[chain["asym_id"]]
+                old_chain_info = record.chains[old_chain_idx]
+                new_chain_info = replace(
+                    old_chain_info,
+                    chain_id=int(chain["asym_id"]),
+                    valid=True,
+                )
+                chain_info.append(new_chain_info)
+
+            output_opts = getattr(record, "output_options", None)
+            align_opts = (
+                output_opts.align_to_template
+                if output_opts is not None
+                else None
+            )
+            sdf_opts = (
+                output_opts.aligned_ligand_sdf
+                if output_opts is not None
+                else None
+            )
+            export_ranks = (
+                self._select_export_ranks(sdf_opts, coord.shape[0])
+                if (sdf_opts is not None and sdf_opts.enabled)
+                else set()
+            )
+            extra_mols = (
+                self._load_extra_mols(record.id)
+                if (sdf_opts is not None and sdf_opts.enabled)
+                else {}
+            )
+
             for model_idx in range(coord.shape[0]):
                 # Get model coord
                 model_coord = coord[model_idx]
                 # Unpad
                 coord_unpad = model_coord[pad_mask.bool()]
                 coord_unpad = coord_unpad.cpu().numpy()
+                if align_opts is not None:
+                    try:
+                        coord_unpad = self._align_coords_to_template(
+                            coord_unpad,
+                            structure,
+                            chain_info,
+                            align_opts,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(  # noqa: T201
+                            "[output] align_to_template failed for "
+                            f"{record.id}: {exc}. Writing unaligned output."
+                        )
 
                 # New atom table
                 atoms = structure.atoms
@@ -134,18 +375,6 @@ class BoltzWriter(BasePredictionWriter):
                         interfaces=interfaces,
                     )
 
-                # Update chain info
-                chain_info = []
-                for chain in new_structure.chains:
-                    old_chain_idx = chain_map[chain["asym_id"]]
-                    old_chain_info = record.chains[old_chain_idx]
-                    new_chain_info = replace(
-                        old_chain_info,
-                        chain_id=int(chain["asym_id"]),
-                        valid=True,
-                    )
-                    chain_info.append(new_chain_info)
-
                 # Save the structure
                 struct_dir = self.output_dir / record.id
                 struct_dir.mkdir(exist_ok=True)
@@ -156,7 +385,8 @@ class BoltzWriter(BasePredictionWriter):
                     plddts = prediction["plddt"][model_idx]
 
                 # Create path name
-                outname = f"{record.id}_model_{idx_to_rank[model_idx]}"
+                model_rank = idx_to_rank[model_idx]
+                outname = f"{record.id}_model_{model_rank}"
 
                 # Save the structure
                 if self.output_format == "pdb":
@@ -175,16 +405,27 @@ class BoltzWriter(BasePredictionWriter):
                     path = struct_dir / f"{outname}.npz"
                     np.savez_compressed(path, **asdict(new_structure))
 
-                if self.boltz2 and record.affinity and idx_to_rank[model_idx] == 0:
+                if self.boltz2 and record.affinity and model_rank == 0:
                     path = struct_dir / f"pre_affinity_{record.id}.npz"
                     np.savez_compressed(path, **asdict(new_structure))
                     np.array(atoms["coords"][:, None], dtype=Coords)
+
+                if model_rank in export_ranks and sdf_opts is not None:
+                    self._write_aligned_ligand_sdf(
+                        struct_dir=struct_dir,
+                        record=record,
+                        structure=new_structure,
+                        chain_info=chain_info,
+                        model_rank=model_rank,
+                        export_cfg=sdf_opts,
+                        extra_mols=extra_mols,
+                    )
 
                 # Save confidence summary
                 if "plddt" in prediction:
                     path = (
                         struct_dir
-                        / f"confidence_{record.id}_model_{idx_to_rank[model_idx]}.json"
+                        / f"confidence_{record.id}_model_{model_rank}.json"
                     )
                     confidence_summary_dict = {}
                     for key in [
@@ -224,7 +465,7 @@ class BoltzWriter(BasePredictionWriter):
                     plddt = prediction["plddt"][model_idx]
                     path = (
                         struct_dir
-                        / f"plddt_{record.id}_model_{idx_to_rank[model_idx]}.npz"
+                        / f"plddt_{record.id}_model_{model_rank}.npz"
                     )
                     np.savez_compressed(path, plddt=plddt.cpu().numpy())
 
@@ -233,7 +474,7 @@ class BoltzWriter(BasePredictionWriter):
                     pae = prediction["pae"][model_idx]
                     path = (
                         struct_dir
-                        / f"pae_{record.id}_model_{idx_to_rank[model_idx]}.npz"
+                        / f"pae_{record.id}_model_{model_rank}.npz"
                     )
                     np.savez_compressed(path, pae=pae.cpu().numpy())
 
@@ -242,7 +483,7 @@ class BoltzWriter(BasePredictionWriter):
                     pde = prediction["pde"][model_idx]
                     path = (
                         struct_dir
-                        / f"pde_{record.id}_model_{idx_to_rank[model_idx]}.npz"
+                        / f"pde_{record.id}_model_{model_rank}.npz"
                     )
                     np.savez_compressed(path, pde=pde.cpu().numpy())
                 

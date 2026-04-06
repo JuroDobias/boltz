@@ -1314,6 +1314,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         output_format=output_format,
         boltz2=model == "boltz2",
         write_embeddings=write_embeddings,
+        extra_mols_dir=processed.extra_mols_dir,
     )
 
     # Set up trainer

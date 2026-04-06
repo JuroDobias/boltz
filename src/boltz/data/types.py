@@ -614,6 +614,37 @@ class TemplateLigandInfo:
 
 
 @dataclass(frozen=True)
+class AlignToTemplateOutput:
+    """Output alignment settings."""
+
+    path: str
+    chain_map: Optional[dict[str, str]] = None
+    atom: str = "CA"
+
+
+@dataclass(frozen=True)
+class AlignedLigandSDFOutput:
+    """Aligned ligand SDF export settings."""
+
+    enabled: bool = False
+    ligand_id: Optional[str] = None
+    export: str = "all"
+    top_k: Optional[int] = None
+    add_hydrogens: bool = True
+    chemistry_source: str = "smiles_first_fallback"
+    file_pattern: str = "{record}_model_{rank}_{ligand}.sdf"
+    smiles: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class OutputOptions:
+    """Output postprocessing options."""
+
+    align_to_template: Optional[AlignToTemplateOutput] = None
+    aligned_ligand_sdf: Optional[AlignedLigandSDFOutput] = None
+
+
+@dataclass(frozen=True)
 class AffinityInfo:
     """AffinityInfo datatype."""
 
@@ -632,6 +663,7 @@ class Record(JSONSerializable):
     inference_options: Optional[InferenceOptions] = None
     templates: Optional[list[TemplateInfo]] = None
     template_ligand: Optional["TemplateLigandInfo"] = None
+    output_options: Optional[OutputOptions] = None
     md: Optional[MDInfo] = None
     affinity: Optional[AffinityInfo] = None
 
