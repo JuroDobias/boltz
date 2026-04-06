@@ -9,7 +9,6 @@ import torch
 from numba import types
 from rdkit import Chem
 from rdkit.Chem import Mol
-import gemmi
 from scipy.spatial.distance import cdist
 from torch import Tensor, from_numpy
 from torch.nn.functional import one_hot
@@ -21,6 +20,7 @@ from boltz.data.mol import (
     get_ligand_symmetries,
     get_symmetries,
 )
+from boltz.data.parse.template_reader import load_template_atom_lookup
 from boltz.data.pad import pad_dim
 from boltz.data.types import (
     MSA,
@@ -1876,28 +1876,24 @@ def process_template_ligand_features(
     prot_asym = chain_name_to_asym[info.protein_id]
     lig_asym = chain_name_to_asym[info.ligand_id]
 
-    # Load reference structure (PDB or CIF)
-    ref_struct = gemmi.read_structure(info.path)
-    ref_model = ref_struct[0]
-
-    # Build reference coordinate lookup: (chain, res_idx, atom_name) -> coord
-    ref_coords_lookup = {}
-    for chain in ref_model:
-        if info.template_id is not None and chain.name != info.template_id:
-            continue
-        for res in chain:
-            if len(res) == 0:
-                continue
-            try:
-                res_idx = int(res.seqid.num)
-            except Exception:
-                continue
-            for atom in res:
-                ref_coords_lookup[(chain.name, res_idx, atom.name.strip())] = (
-                    atom.pos.x,
-                    atom.pos.y,
-                    atom.pos.z,
-                )
+    # Load reference structure (PDB or CIF) into an atom lookup.
+    try:
+        ref_coords_lookup = load_template_atom_lookup(
+            info.path,
+            template_chain_id=info.template_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[template] failed to load template_ligand reference '{info.path}': {exc}")  # noqa: T201
+        return {
+            "template_core_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_coords": torch.empty((1, 0, 3), dtype=torch.float32),
+            "template_core_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_align_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
+            "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_potential": torch.zeros((1,), dtype=torch.long),
+        }
 
     atoms = data.structure.atoms
     residues = data.structure.residues
@@ -1928,12 +1924,12 @@ def process_template_ligand_features(
         res_atom_names = {a["name"] for a in atoms[res_start:res_end]}
         if "CB" not in res_atom_names:
             atom_name = "CA"
-        key = (info.template_id or info.protein_id, res_idx, atom_name)
+        key = (info.template_id or info.protein_id, res_idx, atom_name.upper())
         if key not in ref_coords_lookup:
             continue
         if (res_idx, atom_name) not in name_to_atom_idx:
             continue
-        ref_coords.append(ref_coords_lookup[key])
+        ref_coords.append(tuple(float(x) for x in ref_coords_lookup[key]))
         ref_mask.append(True)
         align_mask.append(True)
         ref_atom_index.append(name_to_atom_idx[(res_idx, atom_name)])
