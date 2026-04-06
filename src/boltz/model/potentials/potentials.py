@@ -858,7 +858,7 @@ def get_potentials(steering_args, boltz2=False):
                         "resampling_weight": 0.1,
                         "bond_buffer": 0.125,
                         "angle_buffer": 0.125,
-                        "clash_buffer": 0.10,
+                        "clash_buffer": 0.1,
                     }
                 ),
                 ChiralAtomPotential(
@@ -902,7 +902,7 @@ def get_potentials(steering_args, boltz2=False):
                     parameters={
                         "guidance_interval": 4,
                         "guidance_weight": PiecewiseStepFunction(
-                                thresholds=[0.25, 0.75], values=[1, 1, 1]
+                                thresholds=[0.1, 0.5], values=[0.1, 0.5, 1]
                             )
                         if steering_args["contact_guidance_update"]
                         else 0.0,
