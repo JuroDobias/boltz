@@ -1,4 +1,5 @@
 import json
+import os
 import pickle
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -53,13 +54,42 @@ class BoltzWriter(BasePredictionWriter):
         self.write_embeddings = write_embeddings
         self.extra_mols_dir = Path(extra_mols_dir) if extra_mols_dir is not None else None
         self._template_cache: dict[str, dict[str, dict[int, np.ndarray]]] = {}
+        self.debug_logs = os.getenv("BOLTZ_DEBUG", "0") == "1"
+
+    def _resolve_template_path(self, template_path: str) -> str:
+        p = Path(template_path).expanduser()
+        if p.exists():
+            return str(p.resolve())
+        if p.is_absolute():
+            return str(p)
+        candidates = [
+            Path.cwd() / p,
+            self.output_dir.parent / p,           # <out_dir>/predictions/../
+            self.output_dir.parent.parent / p,    # <out_dir>/../
+            self.data_dir.parent / p,             # <out_dir>/processed/../
+            self.data_dir.parent.parent / p,      # <out_dir>/../
+        ]
+        # Also try basename walk-up; helps with stale cached relative paths in manifests.
+        basename = Path(template_path).name
+        for root in [Path.cwd(), self.output_dir, self.data_dir]:
+            for ancestor in [root, *root.parents[:4]]:
+                candidates.append(ancestor / basename)
+        for cand in candidates:
+            if cand.exists():
+                return str(cand.resolve())
+        return str(p)
 
     def _load_template_ca_coords(self, template_path: str) -> dict[str, dict[int, np.ndarray]]:
-        cached = self._template_cache.get(template_path)
+        resolved_path = self._resolve_template_path(template_path)
+        cached = self._template_cache.get(resolved_path)
         if cached is not None:
             return cached
-        ca_by_chain = load_template_ca_by_chain(template_path)
-        self._template_cache[template_path] = ca_by_chain
+        if self.debug_logs:
+            print(  # noqa: T201
+                f"[output][align] template path input='{template_path}' resolved='{resolved_path}'"
+            )
+        ca_by_chain = load_template_ca_by_chain(resolved_path)
+        self._template_cache[resolved_path] = ca_by_chain
         return ca_by_chain
 
     def _kabsch(self, src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -69,10 +99,11 @@ class BoltzWriter(BasePredictionWriter):
         dst_centered = dst - dst_centroid
         cov = src_centered.T @ dst_centered
         u, _, vt = np.linalg.svd(cov)
-        rot = vt.T @ u.T
+        # Row-vector convention: x' = x @ R + t, with R = U @ Vt.
+        rot = u @ vt
         if np.linalg.det(rot) < 0:
-            vt[-1, :] *= -1
-            rot = vt.T @ u.T
+            u[:, -1] *= -1
+            rot = u @ vt
         trans = dst_centroid - (src_centroid @ rot)
         return rot.astype(np.float32), trans.astype(np.float32)
 
@@ -89,7 +120,15 @@ class BoltzWriter(BasePredictionWriter):
         }
         query_pts = []
         template_pts = []
+        fallback_query_pts = []
+        fallback_template_pts = []
         chain_map = align_opts.chain_map or {}
+        protein_chain_count = 0
+        missing_template_chain_count = 0
+        missing_residue_count = 0
+        missing_ca_count = 0
+        exact_resnum_matches = 0
+        fallback_pos_matches = 0
 
         for info in chain_info:
             chain_name = info.chain_name
@@ -97,8 +136,10 @@ class BoltzWriter(BasePredictionWriter):
             chain = structure.chains[chain_idx]
             if int(chain["mol_type"]) != const.chain_type_ids["PROTEIN"]:
                 continue
+            protein_chain_count += 1
             template_chain = chain_map.get(chain_name, chain_name)
             if template_chain not in template_ca:
+                missing_template_chain_count += 1
                 continue
             chain_residues = structure.residues[
                 chain["res_idx"] : chain["res_idx"] + chain["res_num"]
@@ -112,22 +153,57 @@ class BoltzWriter(BasePredictionWriter):
                         ca_idx = atom_idx
                         break
                 if ca_idx is None:
+                    missing_ca_count += 1
                     continue
                 res_num = int(residue["res_idx"]) + 1
                 template_coord = template_ca[template_chain].get(res_num)
-                if template_coord is None:
-                    template_coord = template_ca[template_chain].get(chain_pos)
-                if template_coord is None:
+                if template_coord is not None:
+                    query_pts.append(coords[ca_idx])
+                    template_pts.append(template_coord)
+                    exact_resnum_matches += 1
                     continue
-                query_pts.append(coords[ca_idx])
-                template_pts.append(template_coord)
+
+                # Keep positional fallback as a last resort only.
+                template_coord_fallback = template_ca[template_chain].get(chain_pos)
+                if template_coord_fallback is None:
+                    missing_residue_count += 1
+                    continue
+                fallback_query_pts.append(coords[ca_idx])
+                fallback_template_pts.append(template_coord_fallback)
+                fallback_pos_matches += 1
+
+        # Use exact residue-number matches whenever possible.
+        if len(query_pts) < 3 and len(fallback_query_pts) > 0:
+            query_pts = fallback_query_pts
+            template_pts = fallback_template_pts
 
         if len(query_pts) < 3:
+            if self.debug_logs:
+                print(  # noqa: T201
+                    "[output][align] skipped: fewer than 3 matched CA points "
+                    f"(matched={len(query_pts)}, protein_chains={protein_chain_count}, "
+                    f"missing_template_chain={missing_template_chain_count}, "
+                    f"missing_template_residue={missing_residue_count}, "
+                    f"missing_query_ca={missing_ca_count}, "
+                    f"exact_resnum_matches={exact_resnum_matches}, "
+                    f"fallback_pos_matches={fallback_pos_matches})"
+                )
             return coords
 
         query_arr = np.asarray(query_pts, dtype=np.float32)
         template_arr = np.asarray(template_pts, dtype=np.float32)
         rot, trans = self._kabsch(query_arr, template_arr)
+        if self.debug_logs:
+            rmsd_before = float(np.sqrt(((query_arr - template_arr) ** 2).sum(axis=1).mean()))
+            query_aligned = (query_arr @ rot) + trans
+            rmsd_after = float(np.sqrt(((query_aligned - template_arr) ** 2).sum(axis=1).mean()))
+            print(  # noqa: T201
+                "[output][align] applied: "
+                f"matched={len(query_pts)}, rmsd_before={rmsd_before:.3f}, "
+                f"rmsd_after={rmsd_after:.3f}, exact_resnum_matches={exact_resnum_matches}, "
+                f"fallback_pos_matches={fallback_pos_matches}, "
+                f"missing_template_residue={missing_residue_count}"
+            )
         return (coords @ rot) + trans
 
     def _load_extra_mols(self, record_id: str) -> dict:

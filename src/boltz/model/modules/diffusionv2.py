@@ -313,6 +313,7 @@ class AtomDiffusion(Module):
         dihedral_count = 0
         has_dihedral_potential = False
         dihedral_potential = None
+        feats = network_condition_kwargs.get("feats", {})
         debug_logs = steering_args.get("debug", False) if steering_args is not None else False
         if steering_args is not None and (
             steering_args["fk_steering"]
@@ -324,7 +325,6 @@ class AtomDiffusion(Module):
             potentials = []
 
         if potentials:
-            feats = network_condition_kwargs.get("feats", {})
             dihedral_count = (
                 feats["dihedral_index"].shape[-1] if "dihedral_index" in feats else 0
             )
