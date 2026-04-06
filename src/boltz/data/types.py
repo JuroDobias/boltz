@@ -1,5 +1,5 @@
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
@@ -609,8 +609,13 @@ class TemplateLigandInfo:
     ligand_id: str
     template_id: Optional[str] = None
     force: bool = False
-    threshold: float = 0.5
+    ligand_threshold: float = 0.5
+    cacb_threshold: float = 0.5
     potential: str = "harmonic"
+    residues: list[tuple[str, int]] = field(default_factory=list)
+    residue_thresholds: dict[str, float] = field(default_factory=dict)
+    residue_selections: dict[str, str] = field(default_factory=dict)
+    smarts: str = ""
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Optional
 from collections import deque
 import numba
@@ -1846,6 +1847,7 @@ def process_template_ligand_features(
     molecules: dict[str, Mol],
 ) -> dict[str, torch.Tensor]:
     """Process template ligand features."""
+    debug_logs = os.getenv("BOLTZ_DEBUG", "0") == "1"
     info: Optional[TemplateLigandInfo] = getattr(data.record, "template_ligand", None)
     if info is None:
         return {
@@ -1861,6 +1863,7 @@ def process_template_ligand_features(
 
     # Map chain names to asym_id and chain metadata
     chain_name_to_asym = {c["name"]: c["asym_id"] for c in data.structure.chains}
+    chain_name_to_type = {c["name"]: c["mol_type"] for c in data.structure.chains}
     if info.protein_id not in chain_name_to_asym or info.ligand_id not in chain_name_to_asym:
         return {
             "template_core_index": torch.empty((1, 0), dtype=torch.long),
@@ -1876,12 +1879,9 @@ def process_template_ligand_features(
     prot_asym = chain_name_to_asym[info.protein_id]
     lig_asym = chain_name_to_asym[info.ligand_id]
 
-    # Load reference structure (PDB or CIF) into an atom lookup.
+    # Load reference structure (PDB/CIF) into atom lookup.
     try:
-        ref_coords_lookup = load_template_atom_lookup(
-            info.path,
-            template_chain_id=info.template_id,
-        )
+        ref_coords_lookup = load_template_atom_lookup(info.path)
     except Exception as exc:  # noqa: BLE001
         print(f"[template] failed to load template_ligand reference '{info.path}': {exc}")  # noqa: T201
         return {
@@ -1902,6 +1902,18 @@ def process_template_ligand_features(
     ref_mask = []
     align_mask = []
     ref_atom_index = []
+    ref_chain_id = []
+    thresholds_vals: list[float] = []
+    residue_atom_counts = {}
+    mapping_logs: list[str] = []
+    chain_name_to_idx: dict[str, int] = {}
+    next_chain_idx = 0
+    def chain_idx(name: str) -> int:
+        nonlocal next_chain_idx
+        if name not in chain_name_to_idx:
+            chain_name_to_idx[name] = next_chain_idx
+            next_chain_idx += 1
+        return chain_name_to_idx[name]
 
     # Protein CB/CA
     protein_tokens = [
@@ -1929,12 +1941,18 @@ def process_template_ligand_features(
             continue
         if (res_idx, atom_name) not in name_to_atom_idx:
             continue
-        ref_coords.append(tuple(float(x) for x in ref_coords_lookup[key]))
+        ref_coords.append(ref_coords_lookup[key])
         ref_mask.append(True)
         align_mask.append(True)
         ref_atom_index.append(name_to_atom_idx[(res_idx, atom_name)])
+        ref_chain_id.append(chain_idx(info.protein_id))
+        thresholds_vals.append(float(info.cacb_threshold))
+        mapping_logs.append(
+            f"[template] map {info.template_id or info.protein_id}:{res_idx}:{atom_name} -> "
+            f"{info.protein_id}:{res_idx}:{atom_name} (atom_idx={name_to_atom_idx[(res_idx, atom_name)]})"
+        )
 
-    # Ligand core via atom names from SDF substructure match
+    # Ligand core via atom names from SDF substructure match (optionally guided by SMARTS)
     if info.sdf:
         sdf_supplier = Chem.SDMolSupplier(info.sdf, removeHs=False)
         core = sdf_supplier[0] if sdf_supplier and len(sdf_supplier) > 0 else None
@@ -1950,69 +1968,270 @@ def process_template_ligand_features(
             res_name = lig_tokens[0]["res_name"]
             lig_mol = molecules.get(res_name)
             if lig_mol is not None:
-                matches = lig_mol.GetSubstructMatches(core)
+                smarts_query = info.smarts.strip() if hasattr(info, "smarts") else ""
+                smarts_mol = Chem.MolFromSmarts(smarts_query) if smarts_query else None
+                if smarts_query and smarts_mol is None:
+                    raise RuntimeError(f"[template] invalid SMARTS '{info.smarts}'")
+
+                conf = core.GetConformer()
                 best = None
                 best_rmsd = None
                 best_names = None
-                conf = core.GetConformer()
-                for match in matches:
-                    coords_core = []
-                    coords_model = []
-                    names = []
-                    valid = True
-                    for core_idx, lig_idx in enumerate(match):
-                        atom = lig_mol.GetAtomWithIdx(lig_idx)
-                        if not atom.HasProp("name"):
-                            valid = False
-                            break
-                        atom_name = atom.GetProp("name")
-                        print(atom_name)
-                        if atom_name not in lig_atom_names:
-                            valid = False
-                            break
-                        names.append(atom_name)
-                        coords_core.append(conf.GetAtomPosition(core_idx))
-                        coords_model.append(atoms[lig_atom_names[atom_name]]["coords"])
-                    if not valid or len(coords_core) == 0:
-                        continue
-                    coords_core_np = np.array([[p.x, p.y, p.z] for p in coords_core])
-                    coords_model_np = np.array(coords_model)
-                    diff = coords_core_np - coords_model_np
-                    rmsd = np.sqrt((diff**2).sum(axis=1).mean())
-                    if best_rmsd is None or rmsd < best_rmsd:
-                        best_rmsd = rmsd
-                        best = match
-                        best_names = names
+                if smarts_mol:
+                    core_matches = core.GetSubstructMatches(smarts_mol)
+                    if len(core_matches) == 0:
+                        raise RuntimeError(
+                            "[template] SMARTS did not match template ligand core"
+                        )
+                    lig_matches = lig_mol.GetSubstructMatches(smarts_mol)
+                    if len(lig_matches) == 0:
+                        raise RuntimeError(
+                            "[template] SMARTS did not match model ligand"
+                        )
+                    missing_template_names = 0
+                    missing_ligand_names = 0
+                    missing_ligand_in_model = 0
+                    valid_core_named = 0
+                    valid_pair_named = 0
+                    for core_match in core_matches:
+                        core_names = []
+                        coords_core = []
+                        for core_idx in core_match:
+                            atom_core = core.GetAtomWithIdx(core_idx)
+                            core_name = atom_core.GetProp("name") if atom_core.HasProp("name") else None
+                            if core_name is None:
+                                missing_template_names += 1
+                            core_names.append(core_name)
+                            pos = conf.GetAtomPosition(core_idx)
+                            coords_core.append((pos.x, pos.y, pos.z))
+                        coords_core_np = np.array(coords_core)
+                        valid_core_named += 1
+                        for lig_match in lig_matches:
+                            coords_model = []
+                            names = []
+                            valid = True
+                            for lig_idx, core_name in zip(lig_match, core_names):
+                                atom = lig_mol.GetAtomWithIdx(lig_idx)
+                                if not atom.HasProp("name"):
+                                    missing_ligand_names += 1
+                                    valid = False
+                                    break
+                                atom_name = atom.GetProp("name")
+                                match_name = core_name or atom_name
+                                if match_name not in lig_atom_names:
+                                    missing_ligand_in_model += 1
+                                    valid = False
+                                    break
+                                names.append(match_name)
+                                coords_model.append(atoms[lig_atom_names[match_name]]["coords"])
+                            if not valid or len(coords_model) == 0:
+                                continue
+                            valid_pair_named += 1
+                            coords_model_np = np.array(coords_model)
+                            diff = coords_core_np - coords_model_np
+                            rmsd = np.sqrt((diff**2).sum(axis=1).mean())
+                            if best_rmsd is None or rmsd < best_rmsd:
+                                best_rmsd = rmsd
+                                best = (core_match, lig_match, names)
+                                best_names = names
+                else:
+                    matches = lig_mol.GetSubstructMatches(core)
+                    best = None
+                    best_rmsd = None
+                    best_names = None
+                    for match in matches:
+                        coords_core = []
+                        coords_model = []
+                        names = []
+                        valid = True
+                        for core_idx, lig_idx in enumerate(match):
+                            atom = lig_mol.GetAtomWithIdx(lig_idx)
+                            if not atom.HasProp("name"):
+                                valid = False
+                                break
+                            atom_name = atom.GetProp("name")
+                        if debug_logs:
+                            print(atom_name)
+                            if atom_name not in lig_atom_names:
+                                valid = False
+                                break
+                            names.append(atom_name)
+                            coords_core.append(conf.GetAtomPosition(core_idx))
+                            coords_model.append(atoms[lig_atom_names[atom_name]]["coords"])
+                        if not valid or len(coords_core) == 0:
+                            continue
+                        coords_core_np = np.array([[p.x, p.y, p.z] for p in coords_core])
+                        coords_model_np = np.array(coords_model)
+                        diff = coords_core_np - coords_model_np
+                        rmsd = np.sqrt((diff**2).sum(axis=1).mean())
+                        if best_rmsd is None or rmsd < best_rmsd:
+                            best_rmsd = rmsd
+                            best = match
+                            best_names = names
+
                 if best is None:
+                    if smarts_mol:
+                        raise RuntimeError(
+                            "[template] no substructure match between SMARTS "
+                            f"'{info.smarts}' on template ligand and chain {info.ligand_id} "
+                            f"(core_matches={len(core_matches)}, ligand_matches={len(lig_matches)}, "
+                            f"valid_core_named={valid_core_named}, valid_pair_named={valid_pair_named}, "
+                            f"missing_template_names={missing_template_names}, "
+                            f"missing_ligand_names={missing_ligand_names}, "
+                            f"missing_ligand_in_model={missing_ligand_in_model})"
+                        )
                     raise RuntimeError(
                         "[template] no substructure match between core SDF and ligand chain "
-                        f"{info.ligand_id}"
+                        f"{info.ligand_id} (matches={len(matches)})"
                     )
                 names_for_log = best_names
                 if names_for_log is None:
                     # Fallback: derive names (or indices) from the best match
                     names_for_log = []
-                    for _, lig_idx in enumerate(best):
+                    if smarts_mol and isinstance(best, tuple):
+                        _, lig_match, _ = best
+                        iter_idx = lig_match
+                    else:
+                        iter_idx = best
+                    for lig_idx in iter_idx:
                         atom = lig_mol.GetAtomWithIdx(lig_idx)
                         if atom.HasProp("name"):
                             names_for_log.append(atom.GetProp("name"))
                         else:
                             names_for_log.append(f"idx_{lig_idx}")
-                print(  # noqa: T201
-                    "[template] ligand core match atom names "
-                    f"{names_for_log}"
-                )
+                if debug_logs:
+                    print(  # noqa: T201
+                        "[template] ligand core match atom names "
+                        f"{names_for_log}"
+                    )
                 conf = core.GetConformer()
-                for core_idx, lig_idx in enumerate(best):
-                    atom = lig_mol.GetAtomWithIdx(lig_idx)
-                    atom_name = atom.GetProp("name") if atom.HasProp("name") else None
-                    if atom_name is None or atom_name not in lig_atom_names:
-                        continue
-                    atom_pos = conf.GetAtomPosition(core_idx)
-                    ref_coords.append((atom_pos.x, atom_pos.y, atom_pos.z))
-                    ref_mask.append(True)
-                    align_mask.append(False)
-                    ref_atom_index.append(lig_atom_names[atom_name])
+                if smarts_mol and isinstance(best, tuple):
+                    core_match, lig_match, match_names = best
+                    for core_idx, lig_idx, atom_name in zip(core_match, lig_match, match_names):
+                        atom = lig_mol.GetAtomWithIdx(lig_idx)
+                        atom_name = atom.GetProp("name") if atom.HasProp("name") else None
+                        if atom_name is None or atom_name not in lig_atom_names:
+                            continue
+                        atom_pos = conf.GetAtomPosition(core_idx)
+                        ref_coords.append((atom_pos.x, atom_pos.y, atom_pos.z))
+                        ref_mask.append(True)
+                        align_mask.append(False)
+                        ref_atom_index.append(lig_atom_names[atom_name])
+                        ref_chain_id.append(chain_idx(info.ligand_id))
+                        thresholds_vals.append(float(info.ligand_threshold))
+                        residue_atom_counts[(info.ligand_id, lig_tokens[0]["res_idx"] + 1)] = (
+                            residue_atom_counts.get((info.ligand_id, lig_tokens[0]["res_idx"] + 1), 0)
+                            + 1
+                        )
+                        mapping_logs.append(
+                            f"[template] map {info.template_id or info.ligand_id}:{lig_tokens[0]['res_idx'] + 1}:{atom_name} -> "
+                            f"{info.ligand_id}:{lig_tokens[0]['res_idx'] + 1}:{atom_name} "
+                            f"(atom_idx={lig_atom_names[atom_name]})"
+                        )
+                else:
+                    for core_idx, lig_idx in enumerate(best):
+                        atom = lig_mol.GetAtomWithIdx(lig_idx)
+                        atom_name = atom.GetProp("name") if atom.HasProp("name") else None
+                        if atom_name is None or atom_name not in lig_atom_names:
+                            continue
+                        atom_pos = conf.GetAtomPosition(core_idx)
+                        ref_coords.append((atom_pos.x, atom_pos.y, atom_pos.z))
+                        ref_mask.append(True)
+                        align_mask.append(False)
+                        ref_atom_index.append(lig_atom_names[atom_name])
+                        ref_chain_id.append(chain_idx(info.ligand_id))
+                        thresholds_vals.append(float(info.ligand_threshold))
+                        residue_atom_counts[(info.ligand_id, lig_tokens[0]["res_idx"] + 1)] = (
+                            residue_atom_counts.get((info.ligand_id, lig_tokens[0]["res_idx"] + 1), 0)
+                            + 1
+                        )
+                        mapping_logs.append(
+                            f"[template] map {info.template_id or info.ligand_id}:{lig_tokens[0]['res_idx'] + 1}:{atom_name} -> "
+                            f"{info.ligand_id}:{lig_tokens[0]['res_idx'] + 1}:{atom_name} "
+                            f"(atom_idx={lig_atom_names[atom_name]})"
+                        )
+
+    # Additional polymer residues (selection, energy only)
+    if info.residues:
+        for chain_name, res_number in info.residues:
+            if chain_name not in chain_name_to_asym:
+                continue
+            asym_id = chain_name_to_asym[chain_name]
+            chain_type = chain_name_to_type.get(chain_name, None)
+            if chain_type == const.chain_type_ids["NONPOLYMER"]:
+                msg = "template_ligand.residues does not support nonpolymer chains"
+                raise RuntimeError(msg)
+            selection = info.residue_selections.get(
+                f"{chain_name}:{res_number}", "all"
+            ).lower()
+            if selection not in {"ca", "backbone", "all"}:
+                msg = "template_ligand.residues selection must be 'ca', 'backbone', or 'all'"
+                raise RuntimeError(msg)
+            # tokens for this residue in this chain
+            toks_in_res = [
+                t
+                for t in data.tokens
+                if t["asym_id"] == asym_id and t["res_idx"] == res_number - 1
+            ]
+            if len(toks_in_res) == 0:
+                continue
+            atom_indices = []
+            if chain_type == const.chain_type_ids["NONPOLYMER"]:
+                for t in toks_in_res:
+                    start = t["atom_idx"]
+                    end = start + t["atom_num"]
+                    atom_indices.extend(range(start, end))
+            else:
+                tok = toks_in_res[0]
+                start = tok["atom_idx"]
+                end = start + tok["atom_num"]
+                atom_indices.extend(range(start, end))
+            if selection != "all":
+                allowed_atoms = (
+                    {"CA"}
+                    if selection == "ca"
+                    else {"N", "CA", "C", "O"}
+                )
+                atom_indices = [
+                    atom_idx
+                    for atom_idx in atom_indices
+                    if atoms[atom_idx]["name"] in allowed_atoms
+                ]
+
+            template_chain_name = (
+                info.template_id
+                if (info.template_id is not None and chain_name == info.protein_id)
+                else chain_name
+            )
+            for atom_idx in atom_indices:
+                atom_name = atoms[atom_idx]["name"]
+                key = (template_chain_name, res_number, atom_name.upper())
+                if key not in ref_coords_lookup:
+                    continue
+                ref_coords.append(ref_coords_lookup[key])
+                ref_mask.append(True)
+                align_mask.append(False)
+                ref_atom_index.append(atom_idx)
+                ref_chain_id.append(chain_idx(chain_name))
+                default_threshold = (
+                    info.ligand_threshold
+                    if chain_type == const.chain_type_ids["NONPOLYMER"]
+                    else info.cacb_threshold
+                )
+                thresholds_vals.append(
+                    float(
+                        info.residue_thresholds.get(
+                            f"{chain_name}:{res_number}", default_threshold
+                        )
+                    )
+                )
+                residue_atom_counts[(chain_name, res_number)] = residue_atom_counts.get(
+                    (chain_name, res_number), 0
+                ) + 1
+                mapping_logs.append(
+                    f"[template] map {template_chain_name}:{res_number}:{atom_name} -> "
+                    f"{chain_name}:{res_number}:{atom_name} (atom_idx={atom_idx})"
+                )
 
     if len(ref_coords) == 0:
         return {
@@ -2030,13 +2249,26 @@ def process_template_ligand_features(
     ref_mask_t = torch.tensor(ref_mask, dtype=torch.bool).unsqueeze(0)
     align_mask_t = torch.tensor(align_mask, dtype=torch.bool).unsqueeze(0)
     ref_atom_index_t = torch.tensor(ref_atom_index, dtype=torch.long).unsqueeze(0)
-    thresholds = torch.full((1, len(ref_coords)), float(info.threshold), dtype=torch.float32)
+    thresholds = torch.tensor([thresholds_vals], dtype=torch.float32)
+    ref_chain_id_t = torch.tensor([ref_chain_id], dtype=torch.long) if ref_chain_id else torch.empty((1,0), dtype=torch.long)
+    chain_name_table = torch.zeros((next_chain_idx, 4), dtype=torch.int)
+    for name, idx in chain_name_to_idx.items():
+        chain_name_table[idx] = torch.tensor(convert_atom_name(name), dtype=torch.int)
     index = torch.arange(len(ref_coords), dtype=torch.long).unsqueeze(0)
 
     # Map atom indices back to token indices for gradient scatter
     atom_to_token = torch.tensor(data.tokens["token_idx"], dtype=torch.long)
     ref_token_index = ref_atom_index_t.clone()
     potential_id = 0 if info.potential == "harmonic" else 1
+    if debug_logs:
+        if residue_atom_counts:
+            summary = ", ".join(
+                f"{chain}:{res}({cnt})" for (chain, res), cnt in residue_atom_counts.items()
+            )
+            print(f"[template] residue coverage {summary}")  # noqa: T201
+        if mapping_logs:
+            for log_line in mapping_logs:
+                print(log_line)  # noqa: T201
 
     return {
         "template_core_index": index,
@@ -2046,6 +2278,8 @@ def process_template_ligand_features(
         "template_core_threshold": thresholds,
         "template_core_ref_atom_index": ref_atom_index_t,
         "template_core_ref_token_index": ref_token_index,
+        "template_core_ref_chain": ref_chain_id_t,
+        "template_core_chain_names": chain_name_table,
         "template_core_potential": torch.tensor([potential_id], dtype=torch.long),
     }
 
@@ -2136,12 +2370,49 @@ def process_ensemble_features(
 def process_residue_constraint_features(data: Tokenized) -> dict[str, Tensor]:
     residue_constraints = data.residue_constraints
     if residue_constraints is not None:
+        # Identify chains where PoseBusters should be applied
+        if data.record is not None and getattr(data.record, "chains", None) is not None:
+            posebusters_allowed = {
+                int(c.chain_id)
+                for c in data.record.chains
+                if getattr(c, "posebusters", True)
+            }
+        else:
+            posebusters_allowed = {int(c["asym_id"]) for c in data.structure.chains}
+        atom_chain = np.zeros(len(data.structure.atoms), dtype=int)
+        for chain in data.structure.chains:
+            start = chain["atom_idx"]
+            end = start + chain["atom_num"]
+            atom_chain[start:end] = int(chain["asym_id"])
+
         rdkit_bounds_constraints = residue_constraints.rdkit_bounds_constraints
         chiral_atom_constraints = residue_constraints.chiral_atom_constraints
         stereo_bond_constraints = residue_constraints.stereo_bond_constraints
         planar_bond_constraints = residue_constraints.planar_bond_constraints
         planar_ring_5_constraints = residue_constraints.planar_ring_5_constraints
         planar_ring_6_constraints = residue_constraints.planar_ring_6_constraints
+
+        # Filter rdkit bounds to only allowed chains (drop pairs touching disallowed chains)
+        rdkit_pairs = rdkit_bounds_constraints["atom_idxs"]
+        allowed_mask = np.isin(atom_chain[rdkit_pairs], list(posebusters_allowed)).all(
+            axis=1
+        )
+        rdkit_bounds_constraints = rdkit_bounds_constraints[allowed_mask]
+        chiral_atom_constraints = chiral_atom_constraints[
+            np.isin(atom_chain[chiral_atom_constraints["atom_idxs"]], list(posebusters_allowed)).all(axis=1)
+        ]
+        stereo_bond_constraints = stereo_bond_constraints[
+            np.isin(atom_chain[stereo_bond_constraints["atom_idxs"]], list(posebusters_allowed)).all(axis=1)
+        ]
+        planar_bond_constraints = planar_bond_constraints[
+            np.isin(atom_chain[planar_bond_constraints["atom_idxs"]], list(posebusters_allowed)).all(axis=1)
+        ]
+        planar_ring_5_constraints = planar_ring_5_constraints[
+            np.isin(atom_chain[planar_ring_5_constraints["atom_idxs"]], list(posebusters_allowed)).all(axis=1)
+        ]
+        planar_ring_6_constraints = planar_ring_6_constraints[
+            np.isin(atom_chain[planar_ring_6_constraints["atom_idxs"]], list(posebusters_allowed)).all(axis=1)
+        ]
 
         rdkit_bounds_index = torch.tensor(
             rdkit_bounds_constraints["atom_idxs"].copy(), dtype=torch.long
@@ -2383,9 +2654,11 @@ def process_dihedral_feature_constraints(
         tuple[int, int, int, int, float, float, bool, float]
     ]
 ):
-    print(  # noqa: T201
-        f"[constraints] dihedral raw count={len(inference_dihedral_constraints)}"
-    )
+    debug_logs = os.getenv("BOLTZ_DEBUG", "0") == "1"
+    if debug_logs:
+        print(  # noqa: T201
+            f"[constraints] dihedral raw count={len(inference_dihedral_constraints)}"
+        )
     if len(inference_dihedral_constraints) == 0:
         return {
             "dihedral_index": torch.empty((4, 0), dtype=torch.long),
@@ -2403,10 +2676,11 @@ def process_dihedral_feature_constraints(
             a1, a2, a3, a4, target, tol, force = entry[:7]
             weight = entry[7] if len(entry) >= 8 else 1.0
             if not force:
-                print(  # noqa: T201
-                    "[constraints] skipping non-forced dihedral "
-                    f"{(a1, a2, a3, a4)}"
-                )
+                if debug_logs:
+                    print(  # noqa: T201
+                        "[constraints] skipping non-forced dihedral "
+                        f"{(a1, a2, a3, a4)}"
+                    )
                 continue
         else:
             a1, a2, a3, a4, target, tol = entry
@@ -2428,10 +2702,11 @@ def process_dihedral_feature_constraints(
     lower = torch.tensor(lower, dtype=torch.float32)
     upper = torch.tensor(upper, dtype=torch.float32)
     weights = torch.tensor(weights, dtype=torch.float32) if len(weights) > 0 else torch.empty((0,), dtype=torch.float32)
-    print(  # noqa: T201
-        "[constraints] dihedral processed count="
-        f"{index.shape[-1]}, weights set={weights.numel()}"
-    )
+    if debug_logs:
+        print(  # noqa: T201
+            "[constraints] dihedral processed count="
+            f"{index.shape[-1]}, weights set={weights.numel()}"
+        )
     return {
         "dihedral_index": index,
         "dihedral_lower_bounds": lower,
@@ -2638,13 +2913,14 @@ class Boltz2Featurizer:
                 if inference_dihedral_constraints
                 else []
             )
-            print(  # noqa: T201
-                "[constraints] dihedral feature shapes "
-                f"idx={dihedral_constraint_features['dihedral_index'].shape} "
-                f"lower={dihedral_constraint_features['dihedral_lower_bounds'].shape} "
-                f"upper={dihedral_constraint_features['dihedral_upper_bounds'].shape} "
-                f"weights={dihedral_constraint_features['dihedral_weights'].shape}"
-            )
+            if os.getenv("BOLTZ_DEBUG", "0") == "1":
+                print(  # noqa: T201
+                    "[constraints] dihedral feature shapes "
+                    f"idx={dihedral_constraint_features['dihedral_index'].shape} "
+                    f"lower={dihedral_constraint_features['dihedral_lower_bounds'].shape} "
+                    f"upper={dihedral_constraint_features['dihedral_upper_bounds'].shape} "
+                    f"weights={dihedral_constraint_features['dihedral_weights'].shape}"
+                )
 
         return {
             **token_features,

@@ -1007,7 +1007,16 @@ def token_spec_to_ids(
                     f"selected atom '{residue_index_or_atom_name}' (idx {rdkit_atom_idx})"
                 )
 
-        _, _, atom_idx = atom_idx_map[(chain_name, 0, residue_index_or_atom_name)]
+        atom_key = (chain_name, 0, residue_index_or_atom_name)
+        if atom_key not in atom_idx_map:
+            msg = (
+                f"Selected atom '{residue_index_or_atom_name}' on chain {chain_name} "
+                "is not present in the modeled heavy-atom graph. "
+                "If your SMARTS selector points to a hydrogen, select the bonded "
+                "heavy atom instead."
+            )
+            raise ValueError(msg)
+        _, _, atom_idx = atom_idx_map[atom_key]
         return (chain_to_idx[chain_name], atom_idx)
     else:
         if isinstance(residue_index_or_atom_name, (list, tuple)):
@@ -1550,7 +1559,9 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             )
 
             ligand_id += 1
-            smiles_mol = mol_no_h
+            # Keep explicit hydrogens for SMARTS matching robustness.
+            # Downstream structure/features still use heavy-atom representations.
+            smiles_mol = mol
             parsed_chain = ParsedChain(
                 entity=entity_id,
                 residues=[residue],
@@ -1616,7 +1627,8 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                     raise ValueError(msg)
 
             mol_no_h = AllChem.RemoveHs(mol, sanitize=False)
-            smiles_mol = mol_no_h
+            # Preserve hydrogens for SMARTS selectors on SDF ligands.
+            smiles_mol = mol
 
             if affinity:
                 affinity_mw = AllChem.Descriptors.MolWt(mol_no_h)
@@ -1963,8 +1975,25 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                 a2 = _resolve_smarts_atom(c2, [r2, a2])
                 r2 = 1
 
-            c1, r1, a1 = atom_idx_map[(c1, r1 - 1, a1)]  # 1-indexed
-            c2, r2, a2 = atom_idx_map[(c2, r2 - 1, a2)]  # 1-indexed
+            atom1_key = (c1, r1 - 1, a1)  # 1-indexed
+            atom2_key = (c2, r2 - 1, a2)  # 1-indexed
+            if atom1_key not in atom_idx_map:
+                msg = (
+                    f"Selected atom '{a1}' on chain {c1} is not present in the modeled "
+                    "heavy-atom graph. If your SMARTS selector points to a hydrogen, "
+                    "select the bonded heavy atom instead."
+                )
+                raise ValueError(msg)
+            if atom2_key not in atom_idx_map:
+                msg = (
+                    f"Selected atom '{a2}' on chain {c2} is not present in the modeled "
+                    "heavy-atom graph. If your SMARTS selector points to a hydrogen, "
+                    "select the bonded heavy atom instead."
+                )
+                raise ValueError(msg)
+
+            c1, r1, a1 = atom_idx_map[atom1_key]
+            c2, r2, a2 = atom_idx_map[atom2_key]
             connections.append((c1, c2, r1, r2, a1, a2))
         elif "pocket" in constraint:
             if (
@@ -2121,7 +2150,16 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
                         )
                         raise ValueError(msg_inner)
                     atom_name = atom.GetProp("name")
-                    _, _, atom_idx = atom_idx_map[(chain_name, 0, atom_name)]
+                    atom_key = (chain_name, 0, atom_name)
+                    if atom_key not in atom_idx_map:
+                        msg_inner = (
+                            f"Selected atom '{atom_name}' on chain {chain_name} is not "
+                            "present in the modeled heavy-atom graph. "
+                            "If your SMARTS selector points to a hydrogen, select the "
+                            "bonded heavy atom instead."
+                        )
+                        raise ValueError(msg_inner)
+                    _, _, atom_idx = atom_idx_map[atom_key]
                     return atom_idx, atom_name
 
                 d_atoms_with_names = [_get_atom_idx(i) for i in atom_indices]
@@ -2188,13 +2226,100 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
         if chains[ligand_id].type != const.chain_type_ids["NONPOLYMER"]:
             msg = "template_ligand.ligand_id must reference a nonpolymer chain"
             raise ValueError(msg)
-        threshold = float(template_ligand_schema.get("threshold", 0.5))
+        if "threshold" in template_ligand_schema:
+            msg = (
+                "template_ligand.threshold has been removed; "
+                "use ligand_threshold and cacb_threshold"
+            )
+            raise ValueError(msg)
+        ligand_threshold = float(template_ligand_schema.get("ligand_threshold", 0.5))
+        cacb_threshold = float(template_ligand_schema.get("cacb_threshold", 0.5))
         force = bool(template_ligand_schema.get("force", False))
         template_id = template_ligand_schema.get("template_id", None)
         potential = template_ligand_schema.get("potential", "harmonic").lower()
         if potential not in {"harmonic", "linear"}:
             msg = "template_ligand.potential must be 'harmonic' or 'linear'"
             raise ValueError(msg)
+
+        residues_list = template_ligand_schema.get("residues", []) or []
+        chain_types = {name: chain.type for name, chain in chains.items()}
+        parsed_residues: list[tuple[str, int]] = []
+        residue_thresholds: dict[str, float] = {}
+        residue_selections: dict[str, str] = {}
+        allowed_selections = {"ca", "backbone", "all"}
+
+        def _reject_nonpolymer(chain_name: str) -> None:
+            if chain_types.get(chain_name) == const.chain_type_ids["NONPOLYMER"]:
+                msg_inner = "template_ligand.residues does not support nonpolymer chains"
+                raise ValueError(msg_inner)
+
+        def _set_selection(chain_name: str, res_num: int, selection: str) -> None:
+            selection_norm = selection.lower()
+            if selection_norm not in allowed_selections:
+                msg_inner = (
+                    "template_ligand.residues selection must be "
+                    "'ca', 'backbone', or 'all'"
+                )
+                raise ValueError(msg_inner)
+            residue_selections[f"{chain_name}:{res_num}"] = selection_norm
+
+        for entry in residues_list:
+            if isinstance(entry, str):
+                parts = entry.split(":")
+                if len(parts) == 2:
+                    chain_name, res_str = parts
+                    _reject_nonpolymer(chain_name)
+                    parsed_residues.append((chain_name, int(res_str)))
+                elif len(parts) == 3:
+                    chain_name, res_str, thr_str = parts
+                    _reject_nonpolymer(chain_name)
+                    res_num = int(res_str)
+                    parsed_residues.append((chain_name, res_num))
+                    residue_thresholds[f"{chain_name}:{res_num}"] = float(thr_str)
+                else:
+                    msg = (
+                        "template_ligand.residues entries must be "
+                        "'A:70', 'A:70:0.1', [A,70], [A,70,0.1], "
+                        "or [A,70,selection,0.1]"
+                    )
+                    raise ValueError(msg)
+            elif isinstance(entry, (list, tuple)):
+                if len(entry) == 2:
+                    chain_name, res_num = entry[0], entry[1]
+                    chain_name = str(chain_name)
+                    _reject_nonpolymer(chain_name)
+                    parsed_residues.append((chain_name, int(res_num)))
+                elif len(entry) == 3:
+                    if isinstance(entry[2], str):
+                        msg = (
+                            "template_ligand.residues selection requires "
+                            "[chain,res,selection,threshold]"
+                        )
+                        raise ValueError(msg)
+                    chain_name, res_num, thr = entry
+                    chain_name = str(chain_name)
+                    _reject_nonpolymer(chain_name)
+                    res_num = int(res_num)
+                    parsed_residues.append((chain_name, res_num))
+                    residue_thresholds[f"{chain_name}:{res_num}"] = float(thr)
+                elif len(entry) == 4:
+                    chain_name, res_num, selection, thr = entry
+                    chain_name = str(chain_name)
+                    _reject_nonpolymer(chain_name)
+                    if not isinstance(selection, str):
+                        msg = "template_ligand.residues selection must be a string"
+                        raise ValueError(msg)
+                    res_num = int(res_num)
+                    parsed_residues.append((chain_name, res_num))
+                    _set_selection(chain_name, res_num, selection)
+                    residue_thresholds[f"{chain_name}:{res_num}"] = float(thr)
+                else:
+                    msg = (
+                        "template_ligand.residues entries must be "
+                        "'A:70', 'A:70:0.1', [A,70], [A,70,0.1], "
+                        "or [A,70,selection,0.1]"
+                    )
+                    raise ValueError(msg)
 
         pdb_path = template_ligand_schema.get("pdb", None)
         cif_path = template_ligand_schema.get("cif", None)
@@ -2212,8 +2337,13 @@ def parse_boltz_schema(  # noqa: C901, PLR0915, PLR0912
             ligand_id=ligand_id,
             template_id=template_id,
             force=force,
-            threshold=threshold,
+            ligand_threshold=ligand_threshold,
+            cacb_threshold=cacb_threshold,
             potential=potential,
+            residues=parsed_residues,
+            residue_thresholds=residue_thresholds or {},
+            residue_selections=residue_selections or {},
+            smarts=str(template_ligand_schema.get("smarts", "")),
         )
 
     output_options = None
