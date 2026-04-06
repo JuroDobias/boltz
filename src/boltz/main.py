@@ -160,8 +160,9 @@ class BoltzSteeringParams:
     fk_lambda: float = 4.0
     fk_resampling_interval: int = 3
     physical_guidance_update: bool = False
-    contact_guidance_update: bool = True
+    contact_guidance_update: bool = False
     num_gd_steps: int = 20
+    debug: bool = False
 
 
 @rank_zero_only
@@ -755,9 +756,13 @@ def process_inputs(
             "and API key authentication (--api_key_header/--api_key_value). Please use only one authentication method."
         )
 
-    def load_record_safe(path: Path) -> Record:
-        with path.open() as f:
-            data = json.load(f)
+    def load_record_safe(path: Path) -> Optional[Record]:
+        try:
+            with path.open() as f:
+                data = json.load(f)
+        except json.JSONDecodeError:
+            click.echo(f"Skipping invalid record file {path} (invalid JSON).")
+            return None
         io = normalize_inference_options(data.get("inference_options", None))
         data["inference_options"] = io
         return Record.from_dict(data)
@@ -766,7 +771,7 @@ def process_inputs(
     records_dir = out_dir / "processed" / "records"
     if records_dir.exists():
         # Load existing records
-        existing = [load_record_safe(p) for p in records_dir.glob("*.json")]
+        existing = [r for p in records_dir.glob("*.json") for r in [load_record_safe(p)] if r]
         processed_ids = {record.id for record in existing}
 
         # Filter to missing only
@@ -947,6 +952,11 @@ def cli() -> None:
     default="mmcif",
 )
 @click.option(
+    "--debug",
+    is_flag=True,
+    help="Enable verbose steering/template debug logs.",
+)
+@click.option(
     "--num_workers",
     type=int,
     help="The number of dataloader workers to use for prediction. Default is 2.",
@@ -1099,6 +1109,7 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     write_full_pae: bool = False,
     write_full_pde: bool = False,
     output_format: Literal["pdb", "mmcif"] = "mmcif",
+    debug: bool = False,
     num_workers: int = 2,
     override: bool = False,
     seed: Optional[int] = None,
@@ -1143,6 +1154,9 @@ def predict(  # noqa: C901, PLR0915, PLR0912
     # Set seed if desired
     if seed is not None:
         seed_everything(seed)
+
+    if debug:
+        os.environ["BOLTZ_DEBUG"] = "1"
 
     for key in ["CUEQ_DEFAULT_CONFIG", "CUEQ_DISABLE_AOT_TUNING"]:
         # Disable kernel tuning by default,
@@ -1374,6 +1388,10 @@ def predict(  # noqa: C901, PLR0915, PLR0912
         steering_args = BoltzSteeringParams()
         steering_args.fk_steering = use_potentials
         steering_args.physical_guidance_update = use_potentials
+        steering_args.contact_guidance_update = any(
+            getattr(r, "template_ligand", None) is not None for r in manifest.records
+        )
+        steering_args.debug = debug
 
         model_cls = Boltz2 if model == "boltz2" else Boltz1
         model_module = model_cls.load_from_checkpoint(

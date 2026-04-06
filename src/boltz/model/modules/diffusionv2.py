@@ -313,6 +313,7 @@ class AtomDiffusion(Module):
         dihedral_count = 0
         has_dihedral_potential = False
         dihedral_potential = None
+        debug_logs = steering_args.get("debug", False) if steering_args is not None else False
         if steering_args is not None and (
             steering_args["fk_steering"]
             or steering_args["physical_guidance_update"]
@@ -332,13 +333,13 @@ class AtomDiffusion(Module):
                 None,
             )
             has_dihedral_potential = dihedral_potential is not None and dihedral_count > 0
-            if not dihedral_debug_done:
+            if debug_logs and not dihedral_debug_done:
                 print(  # noqa: T201
                     "[steering] dihedral potential present="
                     f"{has_dihedral_potential}, constraints={dihedral_count}"
                 )
                 dihedral_debug_done = True
-            if not stereochem_debug_done:
+            if debug_logs and not stereochem_debug_done:
                 chiral = feats.get("chiral_atom_index", torch.empty((4, 0)))
                 stereo = feats.get("stereo_bond_index", torch.empty((4, 0)))
                 planar = feats.get("planar_bond_index", torch.empty((6, 0)))
@@ -462,27 +463,28 @@ class AtomDiffusion(Module):
                             f"energy={energy[0].item():.4f}"
                         )
                 # Stereochem potentials (chiral / stereo bond / planar)
-                for potential in potentials:
-                    if not isinstance(
-                        potential,
-                        (
-                            ChiralAtomPotential,
-                            StereoBondPotential,
-                            PlanarBondPotential,
-                        ),
-                    ):
-                        continue
-                    params = potential.compute_parameters(steering_t)
-                    energy = potential.compute(
-                        atom_coords_denoised[:1], feats, params
-                    )
-                    print(  # noqa: T201
-                        f"[steering] {potential.__class__.__name__} "
-                        f"step {step_idx} energy={energy[0].item():.4f}"
-                    )
+                if debug_logs:
+                    for potential in potentials:
+                        if not isinstance(
+                            potential,
+                            (
+                                ChiralAtomPotential,
+                                StereoBondPotential,
+                                PlanarBondPotential,
+                            ),
+                        ):
+                            continue
+                        params = potential.compute_parameters(steering_t)
+                        energy = potential.compute(
+                            atom_coords_denoised[:1], feats, params
+                        )
+                        print(  # noqa: T201
+                            f"[steering] {potential.__class__.__name__} "
+                            f"step {step_idx} energy={energy[0].item():.4f}"
+                        )
 
                 # Template core RMSD logging (before guidance)
-                if (
+                if debug_logs and (
                     "template_core_ref_atom_index" in feats
                     and feats["template_core_ref_atom_index"].shape[1] > 0
                 ):
@@ -540,6 +542,46 @@ class AtomDiffusion(Module):
                             if lig_mask.any()
                             else None
                         )
+                        # Per-chain RMSD (raw/aligned) for debugging template coverage
+                        if "template_core_ref_chain" in feats:
+                            chain_ids = feats["template_core_ref_chain"][0].reshape(-1)
+                            chain_name_table = feats.get("template_core_chain_names", None)
+                            chain_name_table = (
+                                chain_name_table.cpu().numpy() if chain_name_table is not None else None
+                            )
+                            for chain_id in torch.unique(chain_ids):
+                                chain_mask = energy_mask & (chain_ids == chain_id)
+                                if not chain_mask.any():
+                                    continue
+                                chain_raw = torch.sqrt(
+                                    ((subset0[chain_mask] - ref_coords[chain_mask]) ** 2)
+                                    .sum(-1)
+                                    .mean()
+                                ).item()
+                                if align_mask.any():
+                                    chain_aligned = torch.sqrt(
+                                        ((subset0[chain_mask] - aligned_ref[chain_mask]) ** 2)
+                                        .sum(-1)
+                                        .mean()
+                                    ).item()
+                                else:
+                                    chain_aligned = chain_raw
+                                chain_label = f"{int(chain_id.item())}"
+                                if (
+                                    chain_name_table is not None
+                                    and chain_id.item() < chain_name_table.shape[0]
+                                ):
+                                    chars = chain_name_table[int(chain_id.item())]
+                                    chars_list = np.array(chars).reshape(-1).tolist()
+                                    chain_label = "".join(
+                                        chr(int(c + 32))
+                                        for c in chars_list
+                                        if int(c) != 0
+                                    ).strip()
+                                print(  # noqa: T201
+                                    f"[template] step {step_idx} chain={chain_label} "
+                                    f"raw={chain_raw:.3f} aligned={chain_aligned:.3f}"
+                                )
                         if not lig_mask.any():
                             print("[template] no ligand atoms in template_core_mask (cropped or match failed)")  # noqa: T201
                         print(  # noqa: T201
@@ -636,14 +678,15 @@ class AtomDiffusion(Module):
                                 if torch.is_tensor(angles)
                                 else np.array([])
                             )
-                            print(  # noqa: T201
-                                "[steering] dihedral gd_step "
-                                f"{guidance_step} angles(deg)={angles_deg[:5].tolist()} "
-                                f"energy={energy[0].item():.4f}"
-                            )
+                            if debug_logs:
+                                print(  # noqa: T201
+                                    "[steering] dihedral gd_step "
+                                    f"{guidance_step} angles(deg)={angles_deg[:5].tolist()} "
+                                    f"energy={energy[0].item():.4f}"
+                                )
                     atom_coords_denoised += guidance_update
                     # Template RMSD after guidance
-                    if (
+                    if debug_logs and (
                         "template_core_ref_atom_index" in feats
                         and feats["template_core_ref_atom_index"].shape[1] > 0
                     ):
@@ -701,6 +744,46 @@ class AtomDiffusion(Module):
                                 if lig_mask.any()
                                 else None
                             )
+                            # Per-chain RMSD after guidance
+                            if "template_core_ref_chain" in feats:
+                                chain_ids = feats["template_core_ref_chain"][0].reshape(-1)
+                                chain_name_table = feats.get("template_core_chain_names", None)
+                                chain_name_table = (
+                                    chain_name_table.cpu().numpy() if chain_name_table is not None else None
+                                )
+                                for chain_id in torch.unique(chain_ids):
+                                    chain_mask = energy_mask & (chain_ids == chain_id)
+                                    if not chain_mask.any():
+                                        continue
+                                    chain_raw = torch.sqrt(
+                                        ((subset0[chain_mask] - ref_coords[chain_mask]) ** 2)
+                                        .sum(-1)
+                                        .mean()
+                                    ).item()
+                                    if align_mask.any():
+                                        chain_aligned = torch.sqrt(
+                                            ((subset0[chain_mask] - aligned_ref[chain_mask]) ** 2)
+                                            .sum(-1)
+                                            .mean()
+                                        ).item()
+                                    else:
+                                        chain_aligned = chain_raw
+                                    chain_label = f"{int(chain_id.item())}"
+                                    if (
+                                        chain_name_table is not None
+                                        and chain_id.item() < chain_name_table.shape[0]
+                                    ):
+                                        chars = chain_name_table[int(chain_id.item())]
+                                        chars_list = np.array(chars).reshape(-1).tolist()
+                                        chain_label = "".join(
+                                            chr(int(c + 32))
+                                            for c in chars_list
+                                            if int(c) != 0
+                                        ).strip()
+                                    print(  # noqa: T201
+                                        f"[template] gd_step {guidance_step} chain={chain_label} "
+                                        f"raw={chain_raw:.3f} aligned={chain_aligned:.3f}"
+                                    )
                             if not lig_mask.any():
                                 print("[template] no ligand atoms in template_core_mask (cropped or match failed)")  # noqa: T201
                             print(  # noqa: T201
