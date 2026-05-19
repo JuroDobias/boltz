@@ -424,9 +424,8 @@ def construct_paired_msa(  # noqa: C901, PLR0915, PLR0912
 
     # Map (chain_id, seq_idx, res_idx) to deletion
     deletions = numba.typed.Dict.empty(
-        key_type=numba.types.Tuple(
-            [numba.types.int64, numba.types.int64, numba.types.int64]),
-        value_type=numba.types.int64
+        key_type=numba.types.UniTuple(numba.types.int64, 3),
+        value_type=numba.types.int64,
     )
     for chain_id, chain_msa in msa.items():
         chain_deletions = chain_msa.deletions
@@ -1981,12 +1980,21 @@ def process_template_ligand_features(
                     core_matches = core.GetSubstructMatches(smarts_mol)
                     if len(core_matches) == 0:
                         raise RuntimeError(
-                            "[template] SMARTS did not match template ligand core"
+                            f"[template] SMARTS did not match template ligand core: "
+                            f"smarts='{smarts_query}', template_id='{info.template_id or info.protein_id}', "
+                            f"ligand_id='{info.ligand_id}', ligand_res='{res_name}', core_matches=0"
                         )
                     lig_matches = lig_mol.GetSubstructMatches(smarts_mol)
                     if len(lig_matches) == 0:
                         raise RuntimeError(
-                            "[template] SMARTS did not match model ligand"
+                            f"[template] SMARTS did not match model ligand: "
+                            f"smarts='{smarts_query}', template_id='{info.template_id or info.protein_id}', "
+                            f"ligand_id='{info.ligand_id}', ligand_res='{res_name}', model_matches=0"
+                        )
+                    if debug_logs:
+                        print(  # noqa: T201
+                            f"[template] SMARTS match candidates: core={len(core_matches)} "
+                            f"model={len(lig_matches)} smarts='{smarts_query}'"
                         )
                     missing_template_names = 0
                     missing_ligand_names = 0

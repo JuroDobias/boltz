@@ -213,6 +213,14 @@ class PredictionDataset(torch.utils.data.Dataset):
             The sampled data features.
 
         """
+        def _raise_record_error(stage: str, err: Exception) -> None:
+            """Raise a record-specific error without recursive retry."""
+            msg = (
+                f"Inference dataset failed at stage '{stage}' for record '{record.id}' "
+                f"(index={idx})."
+            )
+            raise RuntimeError(msg) from err
+
         # Get record
         record = self.manifest.records[idx]
 
@@ -231,10 +239,7 @@ class PredictionDataset(torch.utils.data.Dataset):
         try:
             tokenized = self.tokenizer.tokenize(input_data)
         except Exception as e:  # noqa: BLE001
-            print(  # noqa: T201
-                f"Tokenizer failed on {record.id} with error {e}. Skipping."
-            )
-            return self.__getitem__(0)
+            _raise_record_error("tokenize", e)
 
         if self.affinity:
             try:
@@ -244,8 +249,7 @@ class PredictionDataset(torch.utils.data.Dataset):
                     max_atoms=2048,
                 )
             except Exception as e:  # noqa: BLE001
-                print(f"Cropper failed on {record.id} with error {e}. Skipping.")  # noqa: T201
-                return self.__getitem__(0)
+                _raise_record_error("affinity_crop", e)
 
         # Load conformers
         try:
@@ -256,8 +260,7 @@ class PredictionDataset(torch.utils.data.Dataset):
             mol_names = mol_names - set(molecules.keys())
             molecules.update(load_molecules(self.mol_dir, mol_names))
         except Exception as e:  # noqa: BLE001
-            print(f"Molecule loading failed for {record.id} with error {e}. Skipping.")
-            return self.__getitem__(0)
+            _raise_record_error("load_molecules", e)
 
         # Inference specific options
         options = record.inference_options
@@ -304,11 +307,7 @@ class PredictionDataset(torch.utils.data.Dataset):
                     f"[constraints] batch {record.id} dihedral_index shape={dihedral_idx_shape}"
                 )
         except Exception as e:  # noqa: BLE001
-            import traceback
-
-            traceback.print_exc()
-            print(f"Featurizer failed on {record.id} with error {e}. Skipping.")  # noqa: T201
-            return self.__getitem__(0)
+            _raise_record_error("featurizer_process", e)
 
         # Add record
         features["record"] = record
