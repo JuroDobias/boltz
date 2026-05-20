@@ -696,6 +696,10 @@ class CoreReferencePotential(FlatBottomPotential):
         k, lower_bounds, upper_bounds = args
         align_mask, energy_mask, ref_coords, ref_atom_index, _ = align_args
         ref_atom_index = ref_atom_index.reshape(-1)
+        symmetry_mask = feats.get(
+            "template_core_symmetry_mask",
+            torch.zeros_like(feats["template_core_mask"]),
+        )[0].bool().reshape(-1)
         potential_type = (
             int(feats.get("template_core_potential", torch.tensor([0]))[0].item())
             if isinstance(feats.get("template_core_potential", None), torch.Tensor)
@@ -711,7 +715,8 @@ class CoreReferencePotential(FlatBottomPotential):
         )
         r = subset - aligned_ref
         r_norm = torch.linalg.norm(r, dim=-1)
-        r_norm = r_norm * energy_mask
+        base_energy_mask = energy_mask & ~symmetry_mask
+        r_norm = r_norm * base_energy_mask
         if potential_type == 1:
             upper_expanded = upper_bounds.view(1, -1).expand_as(r_norm)
             k_expanded = k.view(1, -1).expand_as(r_norm)
@@ -729,7 +734,67 @@ class CoreReferencePotential(FlatBottomPotential):
                 negation_mask=None,
                 compute_derivative=False,
             )
-        return energy.sum(dim=tuple(range(1, energy.dim())))
+        total_energy = energy.sum(dim=tuple(range(1, energy.dim())))
+
+        alt_coords = feats.get("template_core_alt_coords", None)
+        alt_ref_atom_index = feats.get("template_core_alt_ref_atom_index", None)
+        alt_threshold = feats.get("template_core_alt_threshold", None)
+        alt_mask = feats.get("template_core_alt_mask", None)
+        if (
+            alt_coords is not None
+            and alt_ref_atom_index is not None
+            and alt_threshold is not None
+            and alt_mask is not None
+            and alt_ref_atom_index[0].numel() > 0
+        ):
+            alt_coords = alt_coords[0].to(coords.device)
+            alt_ref_atom_index = alt_ref_atom_index[0].to(coords.device).long()
+            alt_threshold = alt_threshold[0].to(coords.device)
+            alt_mask = alt_mask[0].to(coords.device).bool()
+            if alt_ref_atom_index.dim() == 3 and alt_ref_atom_index.shape[0] == 1:
+                alt_coords = alt_coords.squeeze(0)
+                alt_ref_atom_index = alt_ref_atom_index.squeeze(0)
+                alt_threshold = alt_threshold.squeeze(0)
+                alt_mask = alt_mask.squeeze(0)
+            if alt_ref_atom_index.shape[0] <= 1:
+                return total_energy
+            align_pad = torch.zeros(
+                alt_ref_atom_index.shape[1],
+                dtype=torch.bool,
+                device=coords.device,
+            )
+            alt_energies = []
+            for alt_idx in range(alt_ref_atom_index.shape[0]):
+                alt_atom_index = alt_ref_atom_index[alt_idx]
+                alt_subset = coords.index_select(-2, alt_atom_index)
+                source_ref = torch.cat((ref_coords, alt_coords[alt_idx].unsqueeze(0)), dim=-2)
+                target_subset = torch.cat((subset, alt_subset), dim=-2)
+                source_align_mask = torch.cat((align_mask, align_pad.unsqueeze(0)), dim=-1)
+                aligned_alt = weighted_rigid_align(
+                    source_ref.float(),
+                    target_subset.float(),
+                    source_align_mask,
+                    source_align_mask,
+                )[..., -alt_atom_index.shape[0] :, :]
+                alt_r = alt_subset - aligned_alt
+                alt_r_norm = torch.linalg.norm(alt_r, dim=-1) * alt_mask[alt_idx]
+                if potential_type == 1:
+                    upper_alt = alt_threshold[alt_idx].view(1, -1).expand_as(alt_r_norm)
+                    alt_energy = torch.zeros_like(alt_r_norm)
+                    pos_over = alt_r_norm > upper_alt
+                    alt_energy[pos_over] = alt_r_norm[pos_over] - upper_alt[pos_over]
+                else:
+                    alt_energy = self.compute_function(
+                        alt_r_norm,
+                        torch.ones_like(alt_threshold[alt_idx]),
+                        lower_bounds,
+                        alt_threshold[alt_idx],
+                        negation_mask=None,
+                        compute_derivative=False,
+                    )
+                alt_energies.append(alt_energy.sum(dim=tuple(range(1, alt_energy.dim()))))
+            total_energy = total_energy + torch.stack(alt_energies, dim=0).min(dim=0).values
+        return total_energy
 
     def compute_gradient(self, coords, feats, parameters):
         index, args, align_args, _, _ = self.compute_args(feats, parameters)
@@ -738,6 +803,10 @@ class CoreReferencePotential(FlatBottomPotential):
         k, lower_bounds, upper_bounds = args
         align_mask, energy_mask, ref_coords, ref_atom_index, ref_token_index = align_args
         ref_atom_index = ref_atom_index.reshape(-1)
+        symmetry_mask = feats.get(
+            "template_core_symmetry_mask",
+            torch.zeros_like(feats["template_core_mask"]),
+        )[0].bool().reshape(-1)
         potential_type = (
             int(feats.get("template_core_potential", torch.tensor([0]))[0].item())
             if isinstance(feats.get("template_core_potential", None), torch.Tensor)
@@ -753,7 +822,8 @@ class CoreReferencePotential(FlatBottomPotential):
         )
         r = subset - aligned_ref
         r_norm = torch.linalg.norm(r, dim=-1)
-        r_norm = r_norm * energy_mask
+        base_energy_mask = energy_mask & ~symmetry_mask
+        r_norm = r_norm * base_energy_mask
         if potential_type == 1:
             upper_expanded = upper_bounds.view(1, -1).expand_as(r_norm)
             k_expanded = k.view(1, -1).expand_as(r_norm)
@@ -775,10 +845,85 @@ class CoreReferencePotential(FlatBottomPotential):
             )
         # gradient w.r.t subset
         grad_unit = r / (r_norm.unsqueeze(-1) + 1e-8)
-        grad_subset = (dEnergy.unsqueeze(-1) * grad_unit) * energy_mask.unsqueeze(-1)
+        grad_subset = (dEnergy.unsqueeze(-1) * grad_unit) * base_energy_mask.unsqueeze(-1)
 
         grad_atom = torch.zeros_like(coords)
         grad_atom.scatter_add_(-2, ref_atom_index.unsqueeze(-1).expand_as(grad_subset), grad_subset)
+        alt_coords = feats.get("template_core_alt_coords", None)
+        alt_ref_atom_index = feats.get("template_core_alt_ref_atom_index", None)
+        alt_threshold = feats.get("template_core_alt_threshold", None)
+        alt_mask = feats.get("template_core_alt_mask", None)
+        if (
+            alt_coords is not None
+            and alt_ref_atom_index is not None
+            and alt_threshold is not None
+            and alt_mask is not None
+            and alt_ref_atom_index[0].numel() > 0
+        ):
+            alt_coords = alt_coords[0].to(coords.device)
+            alt_ref_atom_index = alt_ref_atom_index[0].to(coords.device).long()
+            alt_threshold = alt_threshold[0].to(coords.device)
+            alt_mask = alt_mask[0].to(coords.device).bool()
+            if alt_ref_atom_index.dim() == 3 and alt_ref_atom_index.shape[0] == 1:
+                alt_coords = alt_coords.squeeze(0)
+                alt_ref_atom_index = alt_ref_atom_index.squeeze(0)
+                alt_threshold = alt_threshold.squeeze(0)
+                alt_mask = alt_mask.squeeze(0)
+            if alt_ref_atom_index.shape[0] <= 1:
+                return grad_atom
+            align_pad = torch.zeros(
+                alt_ref_atom_index.shape[1],
+                dtype=torch.bool,
+                device=coords.device,
+            )
+            alt_gradients = []
+            alt_energies = []
+            for alt_idx in range(alt_ref_atom_index.shape[0]):
+                alt_atom_index = alt_ref_atom_index[alt_idx]
+                alt_subset = coords.index_select(-2, alt_atom_index)
+                source_ref = torch.cat((ref_coords, alt_coords[alt_idx].unsqueeze(0)), dim=-2)
+                target_subset = torch.cat((subset.detach(), alt_subset), dim=-2)
+                source_align_mask = torch.cat((align_mask, align_pad.unsqueeze(0)), dim=-1)
+                aligned_alt = weighted_rigid_align(
+                    source_ref.float(),
+                    target_subset.float(),
+                    source_align_mask,
+                    source_align_mask,
+                )[..., -alt_atom_index.shape[0] :, :]
+                alt_r = alt_subset - aligned_alt
+                alt_r_norm = torch.linalg.norm(alt_r, dim=-1) * alt_mask[alt_idx]
+                if potential_type == 1:
+                    upper_alt = alt_threshold[alt_idx].view(1, -1).expand_as(alt_r_norm)
+                    alt_energy = torch.zeros_like(alt_r_norm)
+                    alt_denergy = torch.zeros_like(alt_r_norm)
+                    pos_over = alt_r_norm > upper_alt
+                    alt_energy[pos_over] = alt_r_norm[pos_over] - upper_alt[pos_over]
+                    alt_denergy[pos_over] = 1.0
+                else:
+                    alt_energy, alt_denergy = self.compute_function(
+                        alt_r_norm,
+                        torch.ones_like(alt_threshold[alt_idx]),
+                        lower_bounds,
+                        alt_threshold[alt_idx],
+                        negation_mask=None,
+                        compute_derivative=True,
+                    )
+                alt_grad_unit = alt_r / (alt_r_norm.unsqueeze(-1) + 1e-8)
+                alt_grad_subset = (
+                    alt_denergy.unsqueeze(-1) * alt_grad_unit
+                ) * alt_mask[alt_idx].unsqueeze(-1)
+                alt_grad = torch.zeros_like(coords)
+                alt_grad.scatter_add_(
+                    -2,
+                    alt_atom_index.unsqueeze(-1).expand_as(alt_grad_subset),
+                    alt_grad_subset,
+                )
+                alt_gradients.append(alt_grad)
+                alt_energies.append(alt_energy.sum(dim=tuple(range(1, alt_energy.dim()))))
+            best_alt = torch.stack(alt_energies, dim=0).argmin(dim=0)
+            stacked_grad = torch.stack(alt_gradients, dim=0)
+            for sample_idx in range(coords.shape[0]):
+                grad_atom[sample_idx] += stacked_grad[best_alt[sample_idx], sample_idx]
         return grad_atom
 
 

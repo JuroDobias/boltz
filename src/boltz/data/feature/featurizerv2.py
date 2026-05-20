@@ -1857,6 +1857,11 @@ def process_template_ligand_features(
             "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
             "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
             "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_symmetry_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_alt_coords": torch.empty((1, 0, 0, 3), dtype=torch.float32),
+            "template_core_alt_ref_atom_index": torch.empty((1, 0, 0), dtype=torch.long),
+            "template_core_alt_threshold": torch.empty((1, 0, 0), dtype=torch.float32),
+            "template_core_alt_mask": torch.empty((1, 0, 0), dtype=torch.bool),
             "template_core_potential": torch.zeros((1,), dtype=torch.long),
         }
 
@@ -1872,6 +1877,11 @@ def process_template_ligand_features(
             "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
             "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
             "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_symmetry_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_alt_coords": torch.empty((1, 0, 0, 3), dtype=torch.float32),
+            "template_core_alt_ref_atom_index": torch.empty((1, 0, 0), dtype=torch.long),
+            "template_core_alt_threshold": torch.empty((1, 0, 0), dtype=torch.float32),
+            "template_core_alt_mask": torch.empty((1, 0, 0), dtype=torch.bool),
             "template_core_potential": torch.zeros((1,), dtype=torch.long),
         }
 
@@ -1891,6 +1901,11 @@ def process_template_ligand_features(
             "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
             "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
             "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_symmetry_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_alt_coords": torch.empty((1, 0, 0, 3), dtype=torch.float32),
+            "template_core_alt_ref_atom_index": torch.empty((1, 0, 0), dtype=torch.long),
+            "template_core_alt_threshold": torch.empty((1, 0, 0), dtype=torch.float32),
+            "template_core_alt_mask": torch.empty((1, 0, 0), dtype=torch.bool),
             "template_core_potential": torch.zeros((1,), dtype=torch.long),
         }
 
@@ -1905,6 +1920,8 @@ def process_template_ligand_features(
     thresholds_vals: list[float] = []
     residue_atom_counts = {}
     mapping_logs: list[str] = []
+    symmetry_ref_indices: list[int] = []
+    ligand_alt_mappings: list[tuple[float, list[tuple[int, tuple[float, float, float]]], list[str]]] = []
     chain_name_to_idx: dict[str, int] = {}
     next_chain_idx = 0
     def chain_idx(name: str) -> int:
@@ -1977,14 +1994,15 @@ def process_template_ligand_features(
                 best_rmsd = None
                 best_names = None
                 if smarts_mol:
-                    core_matches = core.GetSubstructMatches(smarts_mol)
+                    alt_candidates = []
+                    core_matches = core.GetSubstructMatches(smarts_mol, uniquify=False)
                     if len(core_matches) == 0:
                         raise RuntimeError(
                             f"[template] SMARTS did not match template ligand core: "
                             f"smarts='{smarts_query}', template_id='{info.template_id or info.protein_id}', "
                             f"ligand_id='{info.ligand_id}', ligand_res='{res_name}', core_matches=0"
                         )
-                    lig_matches = lig_mol.GetSubstructMatches(smarts_mol)
+                    lig_matches = lig_mol.GetSubstructMatches(smarts_mol, uniquify=False)
                     if len(lig_matches) == 0:
                         raise RuntimeError(
                             f"[template] SMARTS did not match model ligand: "
@@ -2042,8 +2060,46 @@ def process_template_ligand_features(
                                 best_rmsd = rmsd
                                 best = (core_match, lig_match, names)
                                 best_names = names
+                            alt_atom_refs = []
+                            alt_names = []
+                            for core_idx, lig_idx in zip(core_match, lig_match):
+                                atom = lig_mol.GetAtomWithIdx(lig_idx)
+                                atom_name = atom.GetProp("name") if atom.HasProp("name") else None
+                                if atom_name is None or atom_name not in lig_atom_names:
+                                    valid = False
+                                    break
+                                pos = conf.GetAtomPosition(core_idx)
+                                alt_atom_refs.append(
+                                    (
+                                        lig_atom_names[atom_name],
+                                        (pos.x, pos.y, pos.z),
+                                    )
+                                )
+                                alt_names.append(atom_name)
+                            if valid:
+                                alt_candidates.append((rmsd, alt_atom_refs, alt_names))
+                    if alt_candidates:
+                        alt_candidates.sort(key=lambda item: item[0])
+                        valid_alt_count = len(alt_candidates)
+                        if debug_logs:
+                            print(  # noqa: T201
+                                "[template] SMARTS valid ligand mapping alternatives="
+                                f"{valid_alt_count}"
+                            )
+                        if valid_alt_count > 4:
+                            print(  # noqa: T201
+                                "[template] SMARTS produced "
+                                f"{valid_alt_count} valid ligand mappings; using "
+                                "symmetry-aware minimum over alternatives"
+                            )
+                        if valid_alt_count > 64:
+                            print(  # noqa: T201
+                                "[template] SMARTS mapping alternatives capped at 64 "
+                                f"(generated {valid_alt_count})"
+                            )
+                        ligand_alt_mappings = alt_candidates[:64]
                 else:
-                    matches = lig_mol.GetSubstructMatches(core)
+                    matches = lig_mol.GetSubstructMatches(core, uniquify=False)
                     best = None
                     best_rmsd = None
                     best_names = None
@@ -2121,6 +2177,7 @@ def process_template_ligand_features(
                         if atom_name is None or atom_name not in lig_atom_names:
                             continue
                         atom_pos = conf.GetAtomPosition(core_idx)
+                        symmetry_ref_indices.append(len(ref_coords))
                         ref_coords.append((atom_pos.x, atom_pos.y, atom_pos.z))
                         ref_mask.append(True)
                         align_mask.append(False)
@@ -2250,6 +2307,11 @@ def process_template_ligand_features(
             "template_core_threshold": torch.empty((1, 0), dtype=torch.float32),
             "template_core_ref_atom_index": torch.empty((1, 0), dtype=torch.long),
             "template_core_ref_token_index": torch.empty((1, 0), dtype=torch.long),
+            "template_core_symmetry_mask": torch.empty((1, 0), dtype=torch.bool),
+            "template_core_alt_coords": torch.empty((1, 0, 0, 3), dtype=torch.float32),
+            "template_core_alt_ref_atom_index": torch.empty((1, 0, 0), dtype=torch.long),
+            "template_core_alt_threshold": torch.empty((1, 0, 0), dtype=torch.float32),
+            "template_core_alt_mask": torch.empty((1, 0, 0), dtype=torch.bool),
             "template_core_potential": torch.zeros((1,), dtype=torch.long),
         }
 
@@ -2258,6 +2320,37 @@ def process_template_ligand_features(
     align_mask_t = torch.tensor(align_mask, dtype=torch.bool).unsqueeze(0)
     ref_atom_index_t = torch.tensor(ref_atom_index, dtype=torch.long).unsqueeze(0)
     thresholds = torch.tensor([thresholds_vals], dtype=torch.float32)
+    symmetry_mask_vals = [False] * len(ref_coords)
+    if len(ligand_alt_mappings) > 1:
+        for ref_idx in symmetry_ref_indices:
+            symmetry_mask_vals[ref_idx] = True
+        alt_coords = [
+            [coords for _, coords in atom_refs]
+            for _, atom_refs, _ in ligand_alt_mappings
+        ]
+        alt_ref_atom_index = [
+            [atom_idx for atom_idx, _ in atom_refs]
+            for _, atom_refs, _ in ligand_alt_mappings
+        ]
+        alt_len = len(alt_ref_atom_index[0]) if alt_ref_atom_index else 0
+        alt_threshold = [
+            [float(info.ligand_threshold)] * alt_len
+            for _ in ligand_alt_mappings
+        ]
+        alt_mask = [
+            [True] * alt_len
+            for _ in ligand_alt_mappings
+        ]
+        alt_coords_t = torch.tensor([alt_coords], dtype=torch.float32)
+        alt_ref_atom_index_t = torch.tensor([alt_ref_atom_index], dtype=torch.long)
+        alt_threshold_t = torch.tensor([alt_threshold], dtype=torch.float32)
+        alt_mask_t = torch.tensor([alt_mask], dtype=torch.bool)
+    else:
+        alt_coords_t = torch.empty((1, 0, 0, 3), dtype=torch.float32)
+        alt_ref_atom_index_t = torch.empty((1, 0, 0), dtype=torch.long)
+        alt_threshold_t = torch.empty((1, 0, 0), dtype=torch.float32)
+        alt_mask_t = torch.empty((1, 0, 0), dtype=torch.bool)
+    symmetry_mask_t = torch.tensor([symmetry_mask_vals], dtype=torch.bool)
     ref_chain_id_t = torch.tensor([ref_chain_id], dtype=torch.long) if ref_chain_id else torch.empty((1,0), dtype=torch.long)
     chain_name_table = torch.zeros((next_chain_idx, 4), dtype=torch.int)
     for name, idx in chain_name_to_idx.items():
@@ -2286,6 +2379,11 @@ def process_template_ligand_features(
         "template_core_threshold": thresholds,
         "template_core_ref_atom_index": ref_atom_index_t,
         "template_core_ref_token_index": ref_token_index,
+        "template_core_symmetry_mask": symmetry_mask_t,
+        "template_core_alt_coords": alt_coords_t,
+        "template_core_alt_ref_atom_index": alt_ref_atom_index_t,
+        "template_core_alt_threshold": alt_threshold_t,
+        "template_core_alt_mask": alt_mask_t,
         "template_core_ref_chain": ref_chain_id_t,
         "template_core_chain_names": chain_name_table,
         "template_core_potential": torch.tensor([potential_id], dtype=torch.long),
