@@ -22,20 +22,28 @@ All the code and weights are provided under MIT license, making them freely avai
 
 > Note: we recommend installing boltz in a fresh python environment
 
-Install boltz with PyPI (recommended):
+Install upstream Boltz with PyPI:
 
 ```
 pip install boltz[cuda] -U
 ```
 
-or directly from GitHub for daily updates:
+Install this fork from GitHub:
 
 ```
-git clone https://github.com/jwohlwend/boltz.git
-cd boltz; pip install -e .[cuda]
+git clone https://github.com/JuroDobias/boltz.git
+cd boltz
+pip install -e ".[cuda]"
 ```
 
-If you are installing on CPU-only or non-CUDA GPus hardware, remove `[cuda]` from the above commands. Note that the CPU version is significantly slower than the GPU version.
+If you are installing into an existing conda environment, activate it first. If another Boltz version is already installed in that environment, remove it before installing this fork:
+
+```
+pip uninstall boltz
+pip install -e ".[cuda]"
+```
+
+If you are installing on CPU-only or non-CUDA GPUs hardware, remove `[cuda]` from the above commands. Note that the CPU version is significantly slower than the GPU version.
 
 ## Inference
 
