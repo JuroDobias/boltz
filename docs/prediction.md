@@ -34,6 +34,9 @@ constraints:
     - bond:
         atom1: [CHAIN_ID, RES_IDX, ATOM_NAME]
         atom2: [CHAIN_ID, RES_IDX, ATOM_NAME]
+    - bond:
+        atom1: [PROTEIN_CHAIN_ID, RES_IDX, ATOM_NAME]
+        atom2: [LIGAND_CHAIN_ID, SMARTS, SMARTS_ATOM_INDEX]
     - pocket:
         binder: CHAIN_ID
         contacts: [[CHAIN_ID, RES_IDX/ATOM_NAME], [CHAIN_ID, RES_IDX/ATOM_NAME]]
@@ -57,6 +60,19 @@ templates:
     - pdb: PDB_PATH # if a pdb path is provided, Boltz will incrementally assign template chain ids based on the chain names in the PDB file (A1, A2, B1, etc)
       chain_id: [CHAIN_ID, CHAIN_ID]
       template_id: [TEMPLATE_CHAIN_ID, TEMPLATE_CHAIN_ID]
+
+template_ligand:
+    protein_id: PROTEIN_CHAIN_ID
+    ligand_id: LIGAND_CHAIN_ID
+    cif: TEMPLATE_COMPLEX_CIF_PATH  # or pdb
+    sdf: TEMPLATE_LIGAND_SDF_PATH
+    template_id: TEMPLATE_PROTEIN_CHAIN_ID  # optional
+    smarts: SMARTS                       # optional ligand core selection
+    force: true
+    ligand_threshold: 0.5
+    cacb_threshold: 0.5
+    potential: harmonic                  # harmonic | linear
+    residues: [[CHAIN_ID, RES_IDX, all, 0.5]]  # optional extra polymer atoms
 properties:
     - affinity:
         binder: CHAIN_ID
@@ -100,7 +116,7 @@ The `cyclic` flag indicates whether a polymer chain (not ligands) is cyclic.
 `constraints` is an optional field that allows you to specify additional information about the input structure. 
 
 
-* The `bond` constraint specifies covalent bonds between two atoms (`atom1` and `atom2`). It is currently only supported for CCD ligands and canonical residues, `CHAIN_ID` refers to the id of the residue set above, `RES_IDX` is the index (starting from 1) of the residue (1 for ligands), and `ATOM_NAME` is the standardized atom name (can be verified in CIF file of that component on the RCSB website).
+* The `bond` constraint specifies a covalent bond between two atoms (`atom1` and `atom2`). For atoms with stable names, use `[CHAIN_ID, RES_IDX, ATOM_NAME]`, where `RES_IDX` is 1-based and `ATOM_NAME` is the standardized atom name. For SMILES-defined ligands, where atom names are not usually known ahead of time, the ligand atom can be selected with SMARTS as `[CHAIN_ID, SMARTS, SMARTS_ATOM_INDEX]`. `SMARTS_ATOM_INDEX` is 1-based within the SMARTS match. For example, `[B, "C(=O)N", 1]` selects the first atom of the first SMARTS match on ligand chain `B`.
 
 * The `pocket` constraint specifies the residues associated with binding interaction, where `binder` refers to the chain binding to the pocket (which can be a molecule, protein, DNA or RNA) and `contacts` is the list of chain and residue indices (starting from 1, or atom names if the chain is a molecule) that form the binding site for the `binder`. `max_distance` specifies the maximum distance (in Angstrom, supported between 4A and 20A with 6A as default) between any atom in the `binder` and any atom in each of the `contacts` elements. If `force` is set to true, a potential will be used to enforce the pocket constraint.
 
@@ -113,15 +129,38 @@ If you wish to explicitly define which of the chains in your YAML should be temp
 
 For any template you provide, you can also specify a `force` flag which will use a potential to enforce that the backbone does not deviate excessively from the template during the prediction. When using `force` one must specify also the `threshold` field which controls the distance (in Angstroms) that the prediction can deviate from the template. 
 
+### Template ligand potential
+`template_ligand` is optional and is intended for docking-like runs against a static receptor/template frame. It restrains the predicted receptor against a reference complex and restrains a ligand core from an SDF file.
+
+Required fields:
+* `protein_id`: protein chain id in the input YAML.
+* `ligand_id`: ligand chain id in the input YAML. This must reference a non-polymer ligand chain.
+* Exactly one of `pdb` or `cif`: reference complex structure.
+* `sdf`: reference ligand/core SDF used for ligand atom coordinates.
+
+Optional fields:
+* `template_id`: protein chain id in the reference structure. If omitted, `protein_id` is used.
+* `smarts`: ligand core SMARTS used to map atoms between the reference SDF and the input ligand.
+* `force`: enables the template ligand potential during sampling.
+* `ligand_threshold`: distance threshold for ligand core atoms.
+* `cacb_threshold`: distance threshold for protein `CA`/`CB` template atoms.
+* `potential`: `harmonic` or `linear`.
+* `residues`: additional polymer residues to restrain, for example `["A:70", "A:71:0.5", [A, 72], [A, 73, 0.5], [A, 74, backbone, 0.5]]`. Selections can be `ca`, `backbone`, or `all`.
+
+When `smarts` matches symmetric ligand cores, Boltz keeps equivalent SMARTS mappings and evaluates the ligand restraint using the lowest-energy mapping during sampling. This avoids forcing arbitrary flipped mappings for symmetric groups such as phenyl rings. If more than 4 valid mappings are found, Boltz prints a warning; at most 64 alternatives are retained.
+
 ### Properties (affinity)
 `properties` is an optional field that allows you to specify whether you want to compute the affinity. If enabled, you must also provide the chain_id corresponding to the small molecule against which the affinity will be computed. Only one single small molecule can be specified for affinity computation. It must be a ligand chain (not a protein, DNA or RNA) and has to be at most 128 atoms counting heavy atoms and hydrogens kept by `RDKit RemoveHs`, however, we do not recommend running the affinity module with ligands significantly larger than 56 atoms (counted as above, limit set during training). At this point, Boltz only supports the computation of affinity of small molecules to protein targets, if ran with an RNA/DNA/co-factor target, the code will not crash but the output will be unreliable.
 
 ### Output postprocessing
 `output` is optional and controls postprocessing exports.
 
-* `align_to_template`: aligns each predicted complex to a template frame using protein `CA` atoms. Provide exactly one of `pdb` or `cif`. Optional `chain_map` maps input chain ids to template chain ids.
-* `aligned_ligand_sdf`: exports aligned ligand coordinates into SDF.
+* `align_to_template`: aligns each predicted complex to a template frame using protein `CA` atoms. Provide exactly one of `pdb` or `cif`. Optional `chain_map` maps input chain ids to template chain ids. This is useful when comparing multiple predictions or using Boltz as a docking protocol against a fixed receptor frame.
+* `aligned_ligand_sdf`: exports ligand coordinates after `align_to_template` has been applied.
   * `ligand_id` selects the ligand chain from your YAML.
+  * `export` controls which ranked predictions are written: `all`, `top1`, or `topk`.
+  * `top_k` is required when `export: topk`.
+  * `file_pattern` controls output names and can use placeholders such as `{record}`, `{rank}`, and `{ligand}`.
   * `chemistry_source: smiles_first_fallback` means the exporter first attempts to assign bond orders from the input SMILES (if available), then falls back to the parsed ligand molecule.
   * `add_hydrogens: true` adds explicit hydrogens with coordinates before SDF write.
 
@@ -141,6 +180,50 @@ sequences:
   - ligand:
       id: [E, F]
       smiles: 'N[C@@H](Cc1ccc(O)cc1)C(=O)O'
+```
+
+### Docking-style example
+
+This example combines a SMILES ligand, a covalent bond constraint selected by SMARTS, a template-ligand potential, output alignment, and aligned ligand SDF export.
+
+```yaml
+version: 1
+sequences:
+  - protein:
+      id: A
+      sequence: GPEEEFGMSLIKHNSCVITTENGKFTGLGVYDRFVVVPTHADPGK
+      msa: receptor.a3m
+  - ligand:
+      id: B
+      smiles: 'CC(C)n1cncc1C(=O)Nc1cccn(C2Cc3ccccc3C2)c1=O'
+
+constraints:
+  - bond:
+      atom1: [A, 147, SG]
+      atom2: [B, "C(=O)N", 1]
+
+template_ligand:
+  protein_id: A
+  ligand_id: B
+  cif: receptor_template.cif
+  sdf: template_ligand_core.sdf
+  template_id: A
+  smarts: "c1ccccc1"
+  force: true
+  ligand_threshold: 0.2
+  cacb_threshold: 2.0
+  potential: harmonic
+
+output:
+  align_to_template:
+    cif: receptor_template.cif
+  aligned_ligand_sdf:
+    enabled: true
+    ligand_id: B
+    export: all
+    add_hydrogens: true
+    chemistry_source: smiles_first_fallback
+    file_pattern: "{record}_model_{rank}_{ligand}.sdf"
 ```
 
 
@@ -208,6 +291,7 @@ out_dir/
         ├── pae_[input_file1]_model_0.npz                      # The predicted PAE score for every pair of tokens
         ├── pde_[input_file1]_model_0.npz                      # The predicted PDE score for every pair of tokens
         ├── plddt_[input_file1]_model_0.npz                    # The predicted pLDDT score for every token
+        ├── [input_file1]_model_0_[ligand].sdf                 # Optional aligned ligand SDF, if output.aligned_ligand_sdf is enabled
         ...
         └── [input_file1]_model_[diffusion_samples-1].cif      # The predicted structure in CIF format
         ...
